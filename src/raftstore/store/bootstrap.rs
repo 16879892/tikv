@@ -21,6 +21,7 @@ use super::peer_storage::{write_initial_apply_state, write_initial_raft_state};
 use super::store::Engines;
 use util::rocksdb;
 use storage::{CF_DEFAULT, CF_RAFT};
+use raftengine::LogBatch;
 
 const INIT_EPOCH_VER: u64 = 1;
 const INIT_EPOCH_CONF_VER: u64 = 1;
@@ -44,12 +45,7 @@ pub fn bootstrap_store(engines: &Engines, cluster_id: u64, store_id: u64) -> Res
         return Err(box_err!("kv store is not empty and has already had data."));
     }
 
-    if !is_range_empty(
-        &engines.raft_engine,
-        CF_DEFAULT,
-        keys::MIN_KEY,
-        keys::MAX_KEY,
-    )? {
+    if !engines.raft_engine.is_empty() {
         return Err(box_err!(
             "raft store is not empty and has already had data."
         ));
@@ -66,7 +62,7 @@ pub fn bootstrap_store(engines: &Engines, cluster_id: u64, store_id: u64) -> Res
 }
 
 // Write first region meta and prepare state.
-pub fn write_prepare_bootstrap(engines: &Engines, region: &metapb::Region) -> Result<()> {
+pub fn write_prepare_bootstrap(engines: &mut Engines, region: &metapb::Region) -> Result<()> {
     let mut state = RegionLocalState::new();
     state.set_region(region.clone());
 
@@ -78,19 +74,17 @@ pub fn write_prepare_bootstrap(engines: &Engines, region: &metapb::Region) -> Re
     engines.kv_engine.write(wb)?;
     engines.kv_engine.sync_wal()?;
 
-    let raft_wb = WriteBatch::new();
-    write_initial_raft_state(&raft_wb, region.get_id())?;
-    engines.raft_engine.write(raft_wb)?;
-    engines.raft_engine.sync_wal()?;
+    let mut raft_wb = LogBatch::default();
+    write_initial_raft_state(&mut raft_wb, region.get_id())?;
+    engines.raft_engine.write(raft_wb, true)?;
     Ok(())
 }
 
 // Clear first region meta and prepare state.
-pub fn clear_prepare_bootstrap(engines: &Engines, region_id: u64) -> Result<()> {
-    engines
-        .raft_engine
-        .delete(&keys::raft_state_key(region_id))?;
-    engines.raft_engine.sync_wal()?;
+pub fn clear_prepare_bootstrap(engines: &mut Engines, region_id: u64) -> Result<()> {
+    let mut raft_wb = LogBatch::default();
+    raft_wb.delete(region_id, &keys::raft_state_key(region_id));
+    engines.raft_engine.write(raft_wb, true)?;
 
     let wb = WriteBatch::new();
     wb.delete(&keys::prepare_bootstrap_key())?;
@@ -112,7 +106,7 @@ pub fn clear_prepare_bootstrap_state(engines: &Engines) -> Result<()> {
 
 // Prepare bootstrap.
 pub fn prepare_bootstrap(
-    engines: &Engines,
+    engines: &mut Engines,
     store_id: u64,
     region_id: u64,
     peer_id: u64,

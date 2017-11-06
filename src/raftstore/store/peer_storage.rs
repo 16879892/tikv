@@ -38,6 +38,7 @@ use super::peer::ReadyContext;
 use super::metrics::*;
 use super::{SnapEntry, SnapKey, SnapManager, SnapshotStatistics};
 use storage::CF_RAFT;
+use raftengine::{LogBatch, MultiRaftEngine as RaftEngine};
 
 // When we create a region peer, we should initialize its log term/index > 0,
 // so that we can force the follower peer to sync the snapshot first.
@@ -118,147 +119,9 @@ pub fn last_index(state: &RaftLocalState) -> u64 {
     state.get_last_index()
 }
 
-#[derive(Default)]
-struct EntryCache {
-    cache: VecDeque<Entry>,
-}
-
-impl EntryCache {
-    fn first_index(&self) -> u64 {
-        self.cache.front().map_or(u64::MAX, |e| e.get_index())
-    }
-
-    fn fetch_entries_to(
-        &self,
-        begin: u64,
-        end: u64,
-        mut fetched_size: u64,
-        max_size: u64,
-        ents: &mut Vec<Entry>,
-    ) {
-        if begin >= end {
-            return;
-        }
-        assert!(!self.cache.is_empty());
-        let cache_low = self.cache.front().unwrap().get_index();
-        let start_idx = begin.checked_sub(cache_low).unwrap() as usize;
-        let limit_idx = end.checked_sub(cache_low).unwrap() as usize;
-
-        let mut end_idx = start_idx;
-        self.cache
-            .iter()
-            .skip(start_idx)
-            .take_while(|e| {
-                let cur_idx = end_idx as u64 + cache_low;
-                assert_eq!(e.get_index(), cur_idx);
-                let m = e.compute_size() as u64;
-                fetched_size += m;
-                if fetched_size == m {
-                    end_idx += 1;
-                    fetched_size <= max_size && end_idx < limit_idx
-                } else if fetched_size <= max_size {
-                    end_idx += 1;
-                    end_idx < limit_idx
-                } else {
-                    false
-                }
-            })
-            .count();
-        // Cache either is empty or contains latest log. Hence we don't need to fetch log
-        // from rocksdb anymore.
-        assert!(end_idx == limit_idx || fetched_size > max_size);
-        let (first, second) = util::slices_in_range(&self.cache, start_idx, end_idx);
-        ents.extend_from_slice(first);
-        ents.extend_from_slice(second);
-    }
-
-    fn append(&mut self, tag: &str, entries: &[Entry]) {
-        if entries.is_empty() {
-            return;
-        }
-        if let Some(cache_last_index) = self.cache.back().map(|e| e.get_index()) {
-            let first_index = entries[0].get_index();
-            if cache_last_index >= first_index {
-                if self.cache.front().unwrap().get_index() >= first_index {
-                    self.cache.clear();
-                } else {
-                    let left = self.cache.len() - (cache_last_index - first_index + 1) as usize;
-                    self.cache.truncate(left);
-                }
-                if self.cache.len() + entries.len() < SHRINK_CACHE_CAPACITY &&
-                    self.cache.capacity() > SHRINK_CACHE_CAPACITY
-                {
-                    self.cache.shrink_to_fit();
-                }
-            } else if cache_last_index + 1 < first_index {
-                panic!(
-                    "{} unexpected hole: {} < {}",
-                    tag,
-                    cache_last_index,
-                    first_index
-                );
-            }
-        }
-        let mut start_idx = 0;
-        if let Some(len) = (self.cache.len() + entries.len()).checked_sub(MAX_CACHE_CAPACITY) {
-            if len < self.cache.len() {
-                self.cache.drain(..len);
-            } else {
-                start_idx = len - self.cache.len();
-                self.cache.clear();
-            }
-        }
-        for e in &entries[start_idx..] {
-            self.cache.push_back(e.to_owned());
-        }
-    }
-
-    pub fn compact_to(&mut self, idx: u64) {
-        let cache_first_idx = match self.cache.front() {
-            None => return,
-            Some(e) => e.get_index(),
-        };
-
-        if cache_first_idx > idx {
-            return;
-        }
-        let cache_last_idx = self.cache.back().unwrap().get_index();
-        self.cache
-            .drain(..(cmp::min(cache_last_idx, idx) - cache_first_idx) as usize);
-        if self.cache.len() < SHRINK_CACHE_CAPACITY &&
-            self.cache.capacity() > SHRINK_CACHE_CAPACITY
-        {
-            // So the peer storage doesn't have much writes since the proposal of compaction,
-            // we can consider this peer is going to be inactive.
-            self.cache.shrink_to_fit();
-        }
-    }
-}
-
-#[derive(Default)]
-pub struct CacheQueryStats {
-    pub hit: u64,
-    pub miss: u64,
-}
-
-impl CacheQueryStats {
-    pub fn flush(&mut self) {
-        RAFT_ENTRY_FETCHES
-            .with_label_values(&["hit"])
-            .inc_by(self.hit as f64)
-            .unwrap();
-        RAFT_ENTRY_FETCHES
-            .with_label_values(&["miss"])
-            .inc_by(self.miss as f64)
-            .unwrap();
-        self.hit = 0;
-        self.miss = 0;
-    }
-}
-
 pub struct PeerStorage {
     pub kv_engine: Arc<DB>,
-    pub raft_engine: Arc<DB>,
+    pub raft_engine: Arc<RaftEngine>,
 
     pub region: metapb::Region,
     pub raft_state: RaftLocalState,
@@ -269,9 +132,6 @@ pub struct PeerStorage {
     snap_state: RefCell<SnapState>,
     region_sched: Scheduler<RegionTask>,
     snap_tried_cnt: RefCell<usize>,
-
-    cache: EntryCache,
-    stats: Rc<RefCell<CacheQueryStats>>,
 
     pub tag: String,
 }
@@ -326,9 +186,12 @@ impl InvokeContext {
     }
 
     #[inline]
-    pub fn save_raft_state_to(&self, raft_wb: &mut WriteBatch) -> Result<()> {
-        raft_wb
-            .put_msg(&keys::raft_state_key(self.region_id), &self.raft_state)?;
+    pub fn save_raft_state_to(&self, raft_wb: &mut LogBatch) -> Result<()> {
+        raft_wb.put_msg(
+            self.region_id,
+            &keys::raft_state_key(self.region_id),
+            &self.raft_state,
+        )?;
         Ok(())
     }
 
@@ -368,8 +231,8 @@ impl InvokeContext {
 
 pub fn recover_from_applying_state(
     kv_engine: &DB,
-    raft_engine: &DB,
-    raft_wb: &WriteBatch,
+    raft_engine: &RaftEngine,
+    raft_wb: &mut LogBatch,
     region_id: u64,
 ) -> Result<()> {
     let snapshot_raft_state_key = keys::snapshot_raft_state_key(region_id);
@@ -386,10 +249,11 @@ pub fn recover_from_applying_state(
         };
 
     let raft_state_key = keys::raft_state_key(region_id);
-    let raft_state: RaftLocalState = match box_try!(raft_engine.get_msg(&raft_state_key)) {
-        Some(state) => state,
-        None => RaftLocalState::new(),
-    };
+    let raft_state: RaftLocalState =
+        match box_try!(raft_engine.get_msg(region_id, &raft_state_key)) {
+            Some(state) => state,
+            None => RaftLocalState::new(),
+        };
 
     // if we recv append log when applying snapshot, last_index in raft_local_state will
     // larger than snapshot_index. since raft_local_state is written to raft engine, and
@@ -398,14 +262,15 @@ pub fn recover_from_applying_state(
     // (snapshot_raft_state), and set snapshot_raft_state.last_index = snapshot_index.
     // after restart, we need check last_index.
     if last_index(&snapshot_raft_state) > last_index(&raft_state) {
-        raft_wb.put_msg(&raft_state_key, &snapshot_raft_state)?;
+        raft_wb
+            .put_msg(region_id, &raft_state_key, &snapshot_raft_state)?;
     }
     Ok(())
 }
 
-fn init_raft_state(raft_engine: &DB, region: &Region) -> Result<RaftLocalState> {
+fn init_raft_state(raft_engine: &mut RaftEngine, region: &Region) -> Result<RaftLocalState> {
     let state_key = keys::raft_state_key(region.get_id());
-    Ok(match raft_engine.get_msg(&state_key)? {
+    Ok(match raft_engine.get_msg(region.get_id(), &state_key)? {
         Some(s) => s,
         None => {
             let mut raft_state = RaftLocalState::new();
@@ -414,7 +279,10 @@ fn init_raft_state(raft_engine: &DB, region: &Region) -> Result<RaftLocalState> 
                 raft_state.set_last_index(RAFT_INIT_LOG_INDEX);
                 raft_state.mut_hard_state().set_term(RAFT_INIT_LOG_TERM);
                 raft_state.mut_hard_state().set_commit(RAFT_INIT_LOG_INDEX);
-                raft_engine.put_msg(&state_key, &raft_state)?;
+
+                let mut log_batch = LogBatch::default();
+                log_batch.put_msg(region.get_id(), &state_key, &raft_state)?;
+                raft_engine.write(log_batch, true)?;
             }
             raft_state
         }
@@ -440,7 +308,7 @@ fn init_apply_state(kv_engine: &DB, region: &Region) -> Result<RaftApplyState> {
 }
 
 fn init_last_term(
-    raft_engine: &DB,
+    raft_engine: &RaftEngine,
     region: &Region,
     raft_state: &RaftLocalState,
     apply_state: &RaftApplyState,
@@ -456,7 +324,9 @@ fn init_last_term(
         assert!(last_idx > RAFT_INIT_LOG_INDEX);
     }
     let last_log_key = keys::raft_log_key(region.get_id(), last_idx);
-    Ok(match raft_engine.get_msg::<Entry>(&last_log_key)? {
+    Ok(match raft_engine
+        .get_msg::<Entry>(region.get_id(), &last_log_key)?
+    {
         None => {
             return Err(box_err!(
                 "[region {}] entry at {} doesn't exist, may lose data.",
@@ -471,14 +341,13 @@ fn init_last_term(
 impl PeerStorage {
     pub fn new(
         kv_engine: Arc<DB>,
-        raft_engine: Arc<DB>,
+        mut raft_engine: Arc<RaftEngine>,
         region: &metapb::Region,
         region_sched: Scheduler<RegionTask>,
         tag: String,
-        stats: Rc<RefCell<CacheQueryStats>>,
     ) -> Result<PeerStorage> {
         debug!("creating storage on {} for {:?}", kv_engine.path(), region);
-        let raft_state = init_raft_state(&raft_engine, region)?;
+        let raft_state = init_raft_state(&mut raft_engine, region)?;
         let apply_state = init_apply_state(&kv_engine, region)?;
         if raft_state.get_last_index() < apply_state.get_applied_index() {
             panic!(
@@ -502,8 +371,6 @@ impl PeerStorage {
             tag: tag,
             applied_index_term: RAFT_INIT_LOG_TERM,
             last_term: last_term,
-            cache: EntryCache::default(),
-            stats: stats,
         })
     }
 
@@ -562,29 +429,7 @@ impl PeerStorage {
         if low == high {
             return Ok(ents);
         }
-        let cache_low = self.cache.first_index();
-        if high <= cache_low {
-            // not overlap
-            self.stats.borrow_mut().miss += 1;
-            self.fetch_entries_to(low, high, max_size, &mut ents)?;
-            return Ok(ents);
-        }
-        let mut fetched_size = 0;
-        let begin_idx = if low < cache_low {
-            self.stats.borrow_mut().miss += 1;
-            fetched_size = self.fetch_entries_to(low, cache_low, max_size, &mut ents)?;
-            if fetched_size > max_size {
-                // max_size exceed.
-                return Ok(ents);
-            }
-            cache_low
-        } else {
-            low
-        };
-
-        self.stats.borrow_mut().hit += 1;
-        self.cache
-            .fetch_entries_to(begin_idx, high, fetched_size, max_size, &mut ents);
+        self.fetch_entries_to(low, high, max_size, &mut ents)?;
         Ok(ents)
     }
 
@@ -595,66 +440,24 @@ impl PeerStorage {
         max_size: u64,
         buf: &mut Vec<Entry>,
     ) -> raft::Result<u64> {
-        let mut total_size: u64 = 0;
-        let mut next_index = low;
-        let mut exceeded_max_size = false;
-        if high - low <= RAFT_LOG_MULTI_GET_CNT {
-            // If election happens in inactive regions, they will just try
-            // to fetch one empty log.
-            for i in low..high {
-                let key = keys::raft_log_key(self.get_region_id(), i);
-                match box_try!(self.raft_engine.get(&key)) {
-                    None => return Err(RaftError::Store(StorageError::Unavailable)),
-                    Some(v) => {
-                        let mut entry = Entry::new();
-                        box_try!(entry.merge_from_bytes(&v));
-                        assert_eq!(entry.get_index(), i);
-                        total_size += v.len() as u64;
-                        if buf.is_empty() || total_size <= max_size {
-                            buf.push(entry);
-                        }
-                        if total_size > max_size {
-                            break;
-                        }
-                    }
-                }
+        match self.raft_engine
+            .fetch_entries_to(self.get_region_id(), low, high, buf)
+        {
+            Ok(total) => {
+                debug!("fetch {} entries from raft-engine", total);
+                Ok(total)
             }
-            return Ok(total_size);
+            Err(e) => {
+                error!(
+                    "Fetch entries [{}, {}) for region {} failed, error: {:?}",
+                    low,
+                    high,
+                    self.get_region_id(),
+                    e
+                );
+                Err(box_err!("Fetch entries failed"))
+            }
         }
-
-        let start_key = keys::raft_log_key(self.get_region_id(), low);
-        let end_key = keys::raft_log_key(self.get_region_id(), high);
-        self.raft_engine.scan(
-            &start_key,
-            &end_key,
-            true, // fill_cache
-            &mut |_, value| {
-                let mut entry = Entry::new();
-                entry.merge_from_bytes(value)?;
-
-                // May meet gap or has been compacted.
-                if entry.get_index() != next_index {
-                    return Ok(false);
-                }
-                next_index += 1;
-
-                total_size += value.len() as u64;
-                exceeded_max_size = total_size > max_size;
-                if !exceeded_max_size || buf.is_empty() {
-                    buf.push(entry);
-                }
-                Ok(!exceeded_max_size)
-            },
-        )?;
-
-        // If we get the correct number of entries, returns,
-        // or the total size almost exceeds max_size, returns.
-        if buf.len() == (high - low) as usize || exceeded_max_size {
-            return Ok(total_size);
-        }
-
-        // Here means we don't fetch enough entries.
-        Err(RaftError::Store(StorageError::Unavailable))
     }
 
     pub fn term(&self, idx: u64) -> raft::Result<u64> {
@@ -848,29 +651,22 @@ impl PeerStorage {
             if entry.get_sync_log() {
                 ready_ctx.sync_log = true;
             }
-            ready_ctx.raft_wb.put_msg(
-                &keys::raft_log_key(self.get_region_id(), entry.get_index()),
-                entry,
-            )?;
         }
+        ready_ctx
+            .raft_wb
+            .add_entries(self.get_region_id(), entries.to_vec());
 
-        // Delete any previously appended log entries which never committed.
-        for i in (last_index + 1)..(prev_last_index + 1) {
-            ready_ctx
-                .raft_wb
-                .delete(&keys::raft_log_key(self.get_region_id(), i))?;
-        }
+        //        // Delete any previously appended log entries which never committed.
+        //        for i in (last_index + 1)..(prev_last_index + 1) {
+        //            ready_ctx
+        //                .raft_wb
+        //                .delete(&keys::raft_log_key(self.get_region_id(), i))?;
+        //        }
 
         invoke_ctx.raft_state.set_last_index(last_index);
         invoke_ctx.last_term = last_term;
 
-        // TODO: if the writebatch is failed to commit, the cache will be wrong.
-        self.cache.append(&self.tag, entries);
         Ok(last_index)
-    }
-
-    pub fn compact_to(&mut self, idx: u64) {
-        self.cache.compact_to(idx);
     }
 
     // Apply the peer with given snapshot.
@@ -879,7 +675,7 @@ impl PeerStorage {
         ctx: &mut InvokeContext,
         snap: &Snapshot,
         kv_wb: &WriteBatch,
-        raft_wb: &WriteBatch,
+        raft_wb: &mut LogBatch,
     ) -> Result<()> {
         info!("{} begin to apply snapshot", self.tag);
 
@@ -929,17 +725,9 @@ impl PeerStorage {
     }
 
     /// Delete all meta belong to the region. Results are stored in `wb`.
-    pub fn clear_meta(&mut self, kv_wb: &WriteBatch, raft_wb: &WriteBatch) -> Result<()> {
+    pub fn clear_meta(&mut self, kv_wb: &WriteBatch, raft_wb: &mut LogBatch) -> Result<()> {
         let region_id = self.get_region_id();
-        clear_meta(
-            &self.kv_engine,
-            &self.raft_engine,
-            kv_wb,
-            raft_wb,
-            region_id,
-            &self.raft_state,
-        )?;
-        self.cache = EntryCache::default();
+        clear_meta(&self.kv_engine, kv_wb, raft_wb, region_id)?;
         Ok(())
     }
 
@@ -981,7 +769,7 @@ impl PeerStorage {
         Ok(())
     }
 
-    pub fn get_raft_engine(&self) -> Arc<DB> {
+    pub fn get_raft_engine(&self) -> Arc<RaftEngine> {
         self.raft_engine.clone()
     }
 
@@ -1102,7 +890,7 @@ impl PeerStorage {
                 &mut ctx,
                 &ready.snapshot,
                 &ready_ctx.kv_wb,
-                &ready_ctx.raft_wb,
+                &mut ready_ctx.raft_wb,
             )?;
             fail_point!("raft_after_apply_snap");
 
@@ -1187,47 +975,23 @@ impl PeerStorage {
 /// Delete all meta belong to the region. Results are stored in `wb`.
 pub fn clear_meta(
     kv_engine: &DB,
-    raft_engine: &DB,
     kv_wb: &WriteBatch,
-    raft_wb: &WriteBatch,
+    raft_wb: &mut LogBatch,
     region_id: u64,
-    raft_state: &RaftLocalState,
 ) -> Result<()> {
     let t = Instant::now();
     let handle = rocksdb::get_cf_handle(kv_engine, CF_RAFT)?;
     kv_wb.delete_cf(handle, &keys::region_state_key(region_id))?;
     kv_wb.delete_cf(handle, &keys::apply_state_key(region_id))?;
 
-    let last_index = last_index(raft_state);
-    let mut first_index = last_index + 1;
-    let begin_log_key = keys::raft_log_key(region_id, 0);
-    let end_log_key = keys::raft_log_key(region_id, first_index);
-    raft_engine.scan(
-        &begin_log_key,
-        &end_log_key,
-        false,
-        &mut |key, _| {
-            first_index = keys::raft_log_index(key).unwrap();
-            Ok(false)
-        },
-    )?;
-    for id in first_index..last_index + 1 {
-        raft_wb.delete(&keys::raft_log_key(region_id, id))?;
-    }
-    raft_wb.delete(&keys::raft_state_key(region_id))?;
+    raft_wb.clean_region(region_id);
 
-    info!(
-        "[region {}] clear peer 1 meta key, 1 apply key, 1 raft key and {} raft logs, takes {:?}",
-        region_id,
-        last_index + 1 - first_index,
-        t.elapsed()
-    );
     Ok(())
 }
 
 pub fn do_snapshot(
     mgr: SnapManager,
-    raft_db: &DB,
+    raft_engine: &RaftEngine,
     snap: &DbSnapshot,
     region_id: u64,
 ) -> raft::Result<Snapshot> {
@@ -1248,9 +1012,7 @@ pub fn do_snapshot(
     let term = if idx == apply_state.get_truncated_state().get_index() {
         apply_state.get_truncated_state().get_term()
     } else {
-        match raft_db
-            .get_msg::<Entry>(&keys::raft_log_key(region_id, idx))?
-        {
+        match raft_engine.get_entry(region_id, idx)? {
             None => return Err(box_err!("entry {} of {} not found.", idx, region_id)),
             Some(entry) => entry.get_term(),
         }
@@ -1307,14 +1069,14 @@ pub fn do_snapshot(
 }
 
 // When we bootstrap the region we must call this to initialize region local state first.
-pub fn write_initial_raft_state<T: Mutable>(raft_wb: &T, region_id: u64) -> Result<()> {
+pub fn write_initial_raft_state(raft_wb: &mut LogBatch, region_id: u64) -> Result<()> {
     let mut raft_state = RaftLocalState::new();
     raft_state.set_last_index(RAFT_INIT_LOG_INDEX);
     raft_state.mut_hard_state().set_term(RAFT_INIT_LOG_TERM);
     raft_state.mut_hard_state().set_commit(RAFT_INIT_LOG_INDEX);
 
     raft_wb
-        .put_msg(&keys::raft_state_key(region_id), &raft_state)?;
+        .put_msg(region_id, &keys::raft_state_key(region_id), &raft_state)?;
     Ok(())
 }
 

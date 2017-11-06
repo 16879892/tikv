@@ -105,29 +105,23 @@ impl Debugger {
         Ok(regions)
     }
 
-    fn get_db_from_type(&self, db: DBType) -> Result<&DB> {
-        match db {
-            DBType::KV => Ok(&self.engines.kv_engine),
-            DBType::RAFT => Ok(&self.engines.raft_engine),
-            _ => Err(box_err!("invalid DBType type")),
-        }
-    }
-
     pub fn get(&self, db: DBType, cf: &str, key: &[u8]) -> Result<Vec<u8>> {
         validate_db_and_cf(db, cf)?;
-        let db = self.get_db_from_type(db)?;
-        match db.get_value_cf(cf, key) {
-            Ok(Some(v)) => Ok(v.to_vec()),
-            Ok(None) => Err(Error::NotFound(
-                format!("value for key {:?} in db {:?}", key, db),
-            )),
-            Err(e) => Err(box_err!(e)),
+        match db {
+            DBType::KV => match self.engines.kv_engine.get_value_cf(cf, key) {
+                Ok(Some(v)) => Ok(v.to_vec()),
+                Ok(None) => Err(Error::NotFound(
+                    format!("value for key {:?} in db {:?}", key, db),
+                )),
+                Err(e) => Err(box_err!(e)),
+            },
+            DBType::RAFT => Err(box_err!("raft-engine can't get")),
+            DBType::INVALID => Err(box_err!("Invalid db type")),
         }
     }
 
     pub fn raft_log(&self, region_id: u64, log_index: u64) -> Result<Entry> {
-        let key = keys::raft_log_key(region_id, log_index);
-        match self.engines.raft_engine.get_msg(&key) {
+        match self.engines.raft_engine.get_entry(region_id, log_index) {
             Ok(Some(entry)) => Ok(entry),
             Ok(None) => Err(Error::NotFound(format!(
                 "raft log for region {} at index {}",
@@ -143,7 +137,7 @@ impl Debugger {
         let raft_state = box_try!(
             self.engines
                 .raft_engine
-                .get_msg::<RaftLocalState>(&raft_state_key)
+                .get_msg::<RaftLocalState>(region_id, &raft_state_key)
         );
 
         let apply_state_key = keys::apply_state_key(region_id);
@@ -214,7 +208,10 @@ impl Debugger {
     /// Compact the cf[start..end) in the db.
     pub fn compact(&self, db: DBType, cf: &str, start: &[u8], end: &[u8]) -> Result<()> {
         validate_db_and_cf(db, cf)?;
-        let db = self.get_db_from_type(db)?;
+        let db = match db {
+            DBType::KV => &self.engines.kv_engine,
+            _ => return Err(box_err!("Only support compact kv engine.")),
+        };
         let handle = box_try!(get_cf_handle(db, cf));
         let start = if start.is_empty() { None } else { Some(start) };
         let end = if end.is_empty() { None } else { Some(end) };
@@ -440,8 +437,7 @@ pub fn validate_db_and_cf(db: DBType, cf: &str) -> Result<()> {
         (DBType::KV, CF_DEFAULT) |
         (DBType::KV, CF_WRITE) |
         (DBType::KV, CF_LOCK) |
-        (DBType::KV, CF_RAFT) |
-        (DBType::RAFT, CF_DEFAULT) => Ok(()),
+        (DBType::KV, CF_RAFT) => Ok(()),
         _ => Err(Error::InvalidArgument(
             format!("invalid cf {:?} for db {:?}", cf, db),
         )),

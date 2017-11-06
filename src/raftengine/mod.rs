@@ -12,6 +12,8 @@ pub mod pipe_log;
 pub mod mem_entries;
 pub mod engine;
 
+
+
 quick_error! {
     #[derive(Debug)]
     pub enum Error {
@@ -53,3 +55,6 @@ quick_error! {
 }
 
 pub type Result<T> = ::std::result::Result<T, Error>;
+
+pub use self::engine::{MultiRaftEngine, RecoveryMode};
+pub use self::log_batch::LogBatch;

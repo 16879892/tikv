@@ -327,20 +327,22 @@ mod tests {
         let s_content = b"short content";
         assert_eq!(pipe_log.append(s_content.as_ref(), false).unwrap(), 3);
         assert_eq!(
-        pipe_log.active_log_size(),
-        FILE_MAGIC_HEADER.len() + VERSION.len() + s_content.len()
+            pipe_log.active_log_size(),
+            FILE_MAGIC_HEADER.len() + VERSION.len() + s_content.len()
         );
         pipe_log
-        .truncate_active_log((FILE_MAGIC_HEADER.len() + VERSION.len()) as u64)
-        .unwrap();
+            .truncate_active_log((FILE_MAGIC_HEADER.len() + VERSION.len()) as u64)
+            .unwrap();
         assert_eq!(
-        pipe_log.active_log_size(),
-        FILE_MAGIC_HEADER.len() + VERSION.len()
+            pipe_log.active_log_size(),
+            FILE_MAGIC_HEADER.len() + VERSION.len()
         );
         assert!(
-        pipe_log
-            .truncate_active_log((FILE_MAGIC_HEADER.len() + VERSION.len() + s_content.len()) as u64)
-            .is_err()
+            pipe_log
+                .truncate_active_log(
+                    (FILE_MAGIC_HEADER.len() + VERSION.len() + s_content.len()) as u64
+                )
+                .is_err()
         );
 
         // read next file

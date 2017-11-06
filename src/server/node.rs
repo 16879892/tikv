@@ -123,7 +123,7 @@ where
     pub fn start<T>(
         &mut self,
         event_loop: EventLoop<Store<T, C>>,
-        engines: Engines,
+        mut engines: Engines,
         trans: T,
         snap_mgr: SnapManager,
         significant_msg_receiver: Receiver<SignificantMsg>,
@@ -149,12 +149,12 @@ where
         }
 
         self.store.set_id(store_id);
-        self.check_prepare_bootstrap_cluster(&engines)?;
+        self.check_prepare_bootstrap_cluster(&mut engines)?;
         if !bootstrapped {
             // cluster is not bootstrapped, and we choose first store to bootstrap
             // prepare bootstrap.
-            let region = self.prepare_bootstrap_cluster(&engines, store_id)?;
-            self.bootstrap_cluster(&engines, region)?;
+            let region = self.prepare_bootstrap_cluster(&mut engines, store_id)?;
+            self.bootstrap_cluster(&mut engines, region)?;
         }
 
         // inform pd.
@@ -225,7 +225,7 @@ where
 
     pub fn prepare_bootstrap_cluster(
         &self,
-        engines: &Engines,
+        engines: &mut Engines,
         store_id: u64,
     ) -> Result<metapb::Region> {
         let region_id = self.alloc_id()?;
@@ -246,7 +246,7 @@ where
         Ok(region)
     }
 
-    fn check_prepare_bootstrap_cluster(&self, engines: &Engines) -> Result<()> {
+    fn check_prepare_bootstrap_cluster(&self, engines: &mut Engines) -> Result<()> {
         let res = engines
             .kv_engine
             .get_msg::<metapb::Region>(&keys::prepare_bootstrap_key())?;
@@ -278,7 +278,7 @@ where
         Err(box_err!("check cluster prepare bootstrapped failed"))
     }
 
-    fn bootstrap_cluster(&mut self, engines: &Engines, region: metapb::Region) -> Result<()> {
+    fn bootstrap_cluster(&mut self, engines: &mut Engines, region: metapb::Region) -> Result<()> {
         let region_id = region.get_id();
         match self.pd_client.bootstrap_cluster(self.store.clone(), region) {
             Err(PdError::ClusterBootstrapped(_)) => {

@@ -91,12 +91,16 @@ impl MemEntries {
         }
     }
 
-    pub fn add_kv(&mut self, key: Vec<u8>, value: Vec<u8>, file_num: u64) {
+    pub fn put_kv(&mut self, key: Vec<u8>, value: Vec<u8>, file_num: u64) {
         self.kvs.insert(key, (value, file_num));
     }
 
-    pub fn get_kv(&self, key: &[u8]) -> Option<&[u8]> {
-        self.kvs.get(key).map(|ref v| v.0.as_slice())
+    pub fn del_kv(&mut self, key: &[u8]) {
+        self.kvs.remove(key);
+    }
+
+    pub fn get_value(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.kvs.get(key).map(|ref v| v.0.clone())
     }
 
     pub fn compact_to(&mut self, idx: u64) {
@@ -134,7 +138,7 @@ impl MemEntries {
         }
     }
 
-    pub fn fetch_entries(&self, begin: u64, end: u64, vec: &mut Vec<Entry>) -> Result<()> {
+    pub fn fetch_entries_to(&self, begin: u64, end: u64, vec: &mut Vec<Entry>) -> Result<u64> {
         if end <= begin {
             return Err(box_err!(
                 "Range error when fetch entries for region {}.",
@@ -172,7 +176,7 @@ impl MemEntries {
         let (first, second) = util::slices_in_range(&self.entry_queue, start_idx, end_idx);
         vec.extend_from_slice(first);
         vec.extend_from_slice(second);
-        Ok(())
+        Ok(first.len() as u64 + second.len() as u64)
     }
 
     pub fn fetch_all(&self, vec: &mut Vec<Entry>) {
@@ -330,16 +334,14 @@ mod tests {
         assert_eq!(ents[12].get_index(), 37);
 
         ents.clear();
-        assert!(mem_entries.fetch_entries(24, 37, &mut ents).is_err());
-        assert!(mem_entries.fetch_entries(40, 45, &mut ents).is_err());
-        mem_entries.fetch_entries(25, 38, &mut ents).unwrap();
-        assert_eq!(ents.len(), 13);
+        assert!(mem_entries.fetch_entries_to(24, 37, &mut ents).is_err());
+        assert!(mem_entries.fetch_entries_to(40, 45, &mut ents).is_err());
+        assert_eq!(mem_entries.fetch_entries_to(25, 38, &mut ents).unwrap(), 13);
         assert_eq!(ents[0].get_index(), 25);
         assert_eq!(ents[12].get_index(), 37);
 
         ents.clear();
-        mem_entries.fetch_entries(30, 40, &mut ents).unwrap();
-        assert_eq!(ents.len(), 8);
+        assert_eq!(mem_entries.fetch_entries_to(30, 40, &mut ents).unwrap(), 8);
         assert_eq!(ents[0].get_index(), 30);
         assert_eq!(ents[7].get_index(), 37);
 

@@ -4,25 +4,28 @@ use std::cmp;
 use std::io::BufRead;
 use std::sync::RwLock;
 
+use protobuf;
+use kvproto::eraftpb::Entry;
+
 use util::collections::HashMap;
 
 use super::Result;
 use super::Error;
 use super::mem_entries::MemEntries;
 use super::pipe_log::{PipeLog, FILE_MAGIC_HEADER, VERSION};
-use super::log_batch::{Command, LogBatch, LogItemType};
+use super::log_batch::{Command, LogBatch, LogItemType, OpType};
 
 const DEFAULT_BYTES_PER_SYNC: usize = 32 * 1024;
 
 const SLOTS_COUNT: usize = 32;
 
 #[derive(Clone, Copy)]
-enum RecoveryMode {
+pub enum RecoveryMode {
     TolerateCorruptedTailRecords = 0,
     AbsoluteConsistency = 1,
 }
 
-struct MultiRaftEngine {
+pub struct MultiRaftEngine {
     // Raft log directory.
     pub dir: String,
 
@@ -41,19 +44,19 @@ struct MultiRaftEngine {
 
 impl MultiRaftEngine {
     pub fn new(
-        dir: String,
+        dir: &str,
         recovery_mode: RecoveryMode,
         bytes_per_sync: usize,
         log_rotate_size: usize,
     ) -> MultiRaftEngine {
-        let pip_log = PipeLog::open(&dir, bytes_per_sync, log_rotate_size)
+        let pip_log = PipeLog::open(dir, bytes_per_sync, log_rotate_size)
             .unwrap_or_else(|e| panic!("Open raft log failed, error: {:?}", e));
         let mut mem_entries = Vec::with_capacity(SLOTS_COUNT);
         for _ in 0..SLOTS_COUNT {
             mem_entries.push(RwLock::new(HashMap::default()));
         }
         let mut engine = MultiRaftEngine {
-            dir: dir,
+            dir: String::from(dir),
             mem_entries: mem_entries,
             next_rewrite_slot: 0,
             pipe_log: RwLock::new(pip_log),
@@ -176,15 +179,33 @@ impl MultiRaftEngine {
                 let mut kvs = vec![];
                 entries.fetch_all_kvs(&mut kvs);
                 for kv in &kvs {
-                    log_batch.add_kv(entries.region_id, &kv.0, &kv.1);
+                    log_batch.put_value(entries.region_id, &kv.0, &kv.1);
                 }
                 {
                     let mut pipe_log = self.pipe_log.write().unwrap();
                     match pipe_log.append_log_batch(&log_batch, false) {
-                        Ok(file_num) => if file_num > 0 {
-                            entries.append(ents, file_num);
-                            for kv in kvs.drain(..) {
-                                entries.add_kv(kv.0, kv.1, file_num);
+                        Ok(file_num) => for item in log_batch.items.drain(..) {
+                            match item.item_type {
+                                LogItemType::Entries => {
+                                    let ents = item.entries.unwrap();
+                                    assert_eq!(ents.region_id, entries.region_id);
+                                    entries.append(ents.entries, file_num);
+                                }
+                                LogItemType::KV => {
+                                    let kv = item.kv.unwrap();
+                                    assert_eq!(kv.region_id, entries.region_id);
+                                    match kv.op_type {
+                                        OpType::Put => {
+                                            entries.put_kv(kv.key, kv.value.unwrap(), file_num);
+                                        }
+                                        OpType::Del => {
+                                            panic!("No delete kv type in memory");
+                                        }
+                                    }
+                                }
+                                LogItemType::CMD => {
+                                    panic!("No command in memory");
+                                }
                             }
                         },
                         Err(e) => panic!("Rewrite inactive region entries failed. error {:?}", e),
@@ -222,7 +243,7 @@ impl MultiRaftEngine {
         }
     }
 
-    pub fn append_log_batch(&mut self, log_batch: LogBatch, sync: bool) -> Result<()> {
+    pub fn write(&mut self, log_batch: LogBatch, sync: bool) -> Result<()> {
         let write_res = {
             let mut pipe_log = self.pipe_log.write().unwrap();
             pipe_log.append_log_batch(&log_batch, sync)
@@ -234,6 +255,79 @@ impl MultiRaftEngine {
             }
             Err(e) => panic!("Append log batch to pipe log failed, error: {:?}", e),
         }
+    }
+
+    pub fn get_value(&self, region_id: u64, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let mem_entries = self.mem_entries[region_id as usize % SLOTS_COUNT]
+            .read()
+            .unwrap();
+        if let Some(mem_entries) = mem_entries.get(&region_id) {
+            Ok(mem_entries.get_value(key))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_msg<M>(&self, region_id: u64, key: &[u8]) -> Result<Option<M>>
+    where
+        M: protobuf::Message + protobuf::MessageStatic,
+    {
+        let value = self.get_value(region_id, key)?;
+
+        if value.is_none() {
+            return Ok(None);
+        }
+
+        let mut m = M::new();
+        m.merge_from_bytes(value.unwrap().as_slice())?;
+        Ok(Some(m))
+    }
+
+    pub fn get_entry(&self, region_id: u64, log_idx: u64) -> Result<Option<Entry>> {
+        let mem_entries = self.mem_entries[region_id as usize % SLOTS_COUNT]
+            .read()
+            .unwrap();
+        if let Some(mem_entries) = mem_entries.get(&region_id) {
+            let mut vec = vec![];
+            mem_entries
+                .fetch_entries_to(log_idx, log_idx + 1, &mut vec)?;
+            Ok(Some(vec[0].clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn fetch_entries_to(
+        &self,
+        region_id: u64,
+        begin: u64,
+        end: u64,
+        vec: &mut Vec<Entry>,
+    ) -> Result<u64> {
+        let mem_entries = self.mem_entries[region_id as usize % SLOTS_COUNT]
+            .read()
+            .unwrap();
+        if let Some(mem_entries) = mem_entries.get(&region_id) {
+            mem_entries.fetch_entries_to(begin, end, vec)
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn clean_region(&mut self, region_id: u64) -> Result<()> {
+        let mut log_batch = LogBatch::default();
+        log_batch.clean_region(region_id);
+        self.write(log_batch, true)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        for mem_entries in &self.mem_entries {
+            let mem_entries = mem_entries.read().unwrap();
+            if !mem_entries.is_empty() {
+                return false;
+            }
+        }
+        true
     }
 
     fn post_append_to_file(&mut self, log_batch: LogBatch, file_num: u64) {
@@ -277,7 +371,14 @@ impl MultiRaftEngine {
                     let mut mem_queue = mem_entries
                         .entry(kv.region_id)
                         .or_insert_with(|| MemEntries::new(kv.region_id));
-                    mem_queue.add_kv(kv.key, kv.value, file_num);
+                    match kv.op_type {
+                        OpType::Put => {
+                            mem_queue.put_kv(kv.key, kv.value.unwrap(), file_num);
+                        }
+                        OpType::Del => {
+                            mem_queue.del_kv(kv.key.as_slice());
+                        }
+                    }
                 }
             }
         }

@@ -72,6 +72,7 @@ use tikv::raftstore::coprocessor::CoprocessorHost;
 use tikv::pd::{PdClient, RpcClient};
 use tikv::util::time::Monitor;
 use tikv::util::rocksdb::metrics_flusher::{MetricsFlusher, DEFAULT_FLUSHER_INTERVAL};
+use tikv::raftengine::engine::{MultiRaftEngine, RecoveryMode};
 
 const RESERVED_OPEN_FDS: u64 = 1000;
 
@@ -179,15 +180,12 @@ fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig) {
         .unwrap_or_else(|e| fatal!("failed to create raft stroage: {:?}", e));
 
     // Create raft engine.
-    let raft_db_opts = cfg.raftdb.build_opt();
-    let raft_db_cf_opts = cfg.raftdb.build_cf_opts();
-    let raft_engine = Arc::new(
-        rocksdb_util::new_engine_opt(
-            raft_db_path.to_str().unwrap(),
-            raft_db_opts,
-            raft_db_cf_opts,
-        ).unwrap_or_else(|s| fatal!("failed to create raft engine: {:?}", s)),
-    );
+    let raft_engine = Arc::new(MultiRaftEngine::new(
+        raft_db_path.to_str().unwrap(),
+        RecoveryMode::TolerateCorruptedTailRecords,
+        32 * 1024,
+        128 * 1024 * 1024,
+    ));
     let engines = Engines::new(kv_engine.clone(), raft_engine.clone());
 
     // Create pd client and pd work, snapshot manager, server.

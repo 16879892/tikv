@@ -14,6 +14,7 @@
 use raftstore::store::keys;
 use raftstore::store::engine::Iterable;
 use util::worker::Runnable;
+use raftengine::MultiRaftEngine as RaftEngine;
 
 use rocksdb::{Writable, WriteBatch, DB};
 use std::sync::Arc;
@@ -22,7 +23,7 @@ use std::error;
 use std::sync::mpsc::Sender;
 
 pub struct Task {
-    pub raft_engine: Arc<DB>,
+    pub raft_engine: Arc<RaftEngine>,
     pub region_id: u64,
     pub start_idx: u64,
     pub end_idx: u64,
@@ -68,31 +69,13 @@ impl Runner {
     /// Do the gc job and return the count of log collected.
     fn gc_raft_log(
         &mut self,
-        raft_engine: Arc<DB>,
+        mut raft_engine: Arc<RaftEngine>,
         region_id: u64,
         start_idx: u64,
         end_idx: u64,
     ) -> Result<u64, Error> {
-        let mut first_idx = start_idx;
-        if first_idx == 0 {
-            let start_key = keys::raft_log_key(region_id, 0);
-            first_idx = end_idx;
-            if let Some((k, _)) = box_try!(raft_engine.seek(&start_key)) {
-                first_idx = box_try!(keys::raft_log_index(&k));
-            }
-        }
-        if first_idx >= end_idx {
-            info!("[region {}] no need to gc", region_id);
-            return Ok(0);
-        }
-        let raft_wb = WriteBatch::new();
-        for idx in first_idx..end_idx {
-            let key = keys::raft_log_key(region_id, idx);
-            box_try!(raft_wb.delete(&key));
-        }
-        // TODO: disable WAL here.
-        raft_engine.write(raft_wb).unwrap();
-        Ok(end_idx - first_idx)
+        raft_engine.compact_to(region_id, end_idx);
+        Ok(end_idx - start_idx)
     }
 
     fn report_collected(&self, collected: u64) {

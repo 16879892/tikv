@@ -1,11 +1,13 @@
 
 use std::u32;
+use std::mem;
 use std::io::BufRead;
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use byteorder::BigEndian;
 use kvproto::eraftpb::Entry;
 use protobuf::Message as PbMsg;
+use protobuf;
 
 use util::codec::number::{NumberDecoder, NumberEncoder};
 
@@ -138,40 +140,71 @@ impl Command {
     }
 }
 
+#[derive(Debug, PartialEq, Copy, Clone)]
+pub enum OpType {
+    Put = 0x01,
+    Del = 0x02,
+}
+
+impl OpType {
+    pub fn encode_to(&self, vec: &mut Vec<u8>) {
+        vec.push(*self as u8);
+    }
+
+    pub fn from_bytes(buf: &mut SliceReader) -> Result<OpType> {
+        let op_type = buf.read_u8()?;
+        unsafe { Ok(mem::transmute(op_type)) }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct KeyValue {
+    pub op_type: OpType,
     pub region_id: u64,
     pub key: Vec<u8>,
-    pub value: Vec<u8>,
+    pub value: Option<Vec<u8>>,
 }
 
 impl KeyValue {
-    pub fn new(region_id: u64, key: &[u8], value: &[u8]) -> KeyValue {
+    pub fn new(op_type: OpType, region_id: u64, key: &[u8], value: Option<&[u8]>) -> KeyValue {
         KeyValue {
+            op_type: op_type,
             region_id: region_id,
             key: key.to_vec(),
-            value: value.to_vec(),
+            value: value.map(|v| v.to_vec()),
         }
     }
 
     pub fn from_bytes(buf: &mut SliceReader) -> Result<KeyValue> {
+        let op_type = OpType::from_bytes(buf)?;
         let region_id = buf.decode_var_u64()?;
         let k_len = buf.decode_var_u64()? as usize;
         let key = &buf[..k_len];
         buf.consume(k_len);
-        let v_len = buf.decode_var_u64()? as usize;
-        let value = &buf[..v_len];
-        buf.consume(v_len);
-        Ok(KeyValue::new(region_id, key, value))
+        match op_type {
+            OpType::Put => {
+                let v_len = buf.decode_var_u64()? as usize;
+                let value = &buf[..v_len];
+                buf.consume(v_len);
+                Ok(KeyValue::new(OpType::Put, region_id, key, Some(value)))
+            }
+            OpType::Del => Ok(KeyValue::new(OpType::Del, region_id, key, None)),
+        }
     }
 
     pub fn encode_to(&self, vec: &mut Vec<u8>) -> Result<()> {
-        // layout = { region_id | k_len | key | v_len | value }
+        // layout = { op_type | region_id | k_len | key | v_len | value }
+        self.op_type.encode_to(vec);
         vec.encode_var_u64(self.region_id)?;
         vec.encode_var_u64(self.key.len() as u64)?;
         vec.extend_from_slice(self.key.as_slice());
-        vec.encode_var_u64(self.value.len() as u64)?;
-        vec.extend_from_slice(self.value.as_slice());
+        match self.op_type {
+            OpType::Put => {
+                vec.encode_var_u64(self.value.as_ref().unwrap().len() as u64)?;
+                vec.extend_from_slice(self.value.as_ref().unwrap().as_slice());
+            }
+            OpType::Del => {}
+        }
         Ok(())
     }
 }
@@ -212,12 +245,12 @@ impl LogItem {
         }
     }
 
-    pub fn from_kv(region_id: u64, key: &[u8], value: &[u8]) -> LogItem {
+    pub fn from_kv(op_type: OpType, region_id: u64, key: &[u8], value: Option<&[u8]>) -> LogItem {
         LogItem {
             item_type: LogItemType::KV,
             entries: None,
             command: None,
-            kv: Some(KeyValue::new(region_id, key, value)),
+            kv: Some(KeyValue::new(op_type, region_id, key, value)),
         }
     }
 
@@ -273,6 +306,52 @@ impl Default for LogBatch {
 }
 
 impl LogBatch {
+    pub fn add_entries(&mut self, region_id: u64, entries: Vec<Entry>) {
+        let item = LogItem::from_entries(region_id, entries);
+        self.items.push(item);
+    }
+
+    pub fn clean_region(&mut self, region_id: u64) {
+        self.add_command(Command::Clean {
+            region_id: region_id,
+        });
+    }
+
+    pub fn add_command(&mut self, cmd: Command) {
+        let item = LogItem::from_command(cmd);
+        self.items.push(item);
+    }
+
+    pub fn add_kv(&mut self, op_type: OpType, region_id: u64, key: &[u8], value: Option<&[u8]>) {
+        let item = LogItem::from_kv(op_type, region_id, key, value);
+        self.items.push(item);
+    }
+
+    pub fn delete(&mut self, region_id: u64, key: &[u8]) {
+        let item = LogItem::from_kv(OpType::Del, region_id, key, None);
+        self.items.push(item);
+    }
+
+    pub fn put_value(&mut self, region_id: u64, key: &[u8], value: &[u8]) {
+        let item = LogItem::from_kv(OpType::Put, region_id, key, Some(value));
+        self.items.push(item);
+    }
+
+    pub fn put_msg<M: protobuf::Message>(
+        &mut self,
+        region_id: u64,
+        key: &[u8],
+        m: &M,
+    ) -> Result<()> {
+        let value = m.write_to_bytes()?;
+        self.put_value(region_id, key, &value);
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
     pub fn from_bytes(buf: &mut SliceReader) -> Result<Option<(LogBatch, usize)>> {
         if buf.is_empty() {
             return Ok(None);
@@ -314,21 +393,6 @@ impl LogBatch {
             items_count -= 1;
         }
         Ok(Some((log_batch, batch_len + 8)))
-    }
-
-    pub fn add_entries(&mut self, region_id: u64, entries: Vec<Entry>) {
-        let item = LogItem::from_entries(region_id, entries);
-        self.items.push(item);
-    }
-
-    pub fn add_command(&mut self, cmd: Command) {
-        let item = LogItem::from_command(cmd);
-        self.items.push(item);
-    }
-
-    pub fn add_kv(&mut self, region_id: u64, key: &[u8], value: &[u8]) {
-        let item = LogItem::from_kv(region_id, key, value);
-        self.items.push(item);
     }
 
     pub fn to_vec(&self) -> Option<Vec<u8>> {
