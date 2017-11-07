@@ -72,7 +72,7 @@ use tikv::raftstore::coprocessor::CoprocessorHost;
 use tikv::pd::{PdClient, RpcClient};
 use tikv::util::time::Monitor;
 use tikv::util::rocksdb::metrics_flusher::{MetricsFlusher, DEFAULT_FLUSHER_INTERVAL};
-use tikv::raftengine::engine::{MultiRaftEngine, RecoveryMode};
+use tikv::raftengine::{MultiRaftEngine, RecoveryMode, DEFAULT_BYTES_PER_SYNC, DEFAULT_LOG_MAX_SIZE};
 
 const RESERVED_OPEN_FDS: u64 = 1000;
 
@@ -183,8 +183,8 @@ fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig) {
     let raft_engine = Arc::new(MultiRaftEngine::new(
         raft_db_path.to_str().unwrap(),
         RecoveryMode::TolerateCorruptedTailRecords,
-        32 * 1024,
-        128 * 1024 * 1024,
+        DEFAULT_BYTES_PER_SYNC,
+        DEFAULT_LOG_MAX_SIZE,
     ));
     let engines = Engines::new(kv_engine.clone(), raft_engine.clone());
 

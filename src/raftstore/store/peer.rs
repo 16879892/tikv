@@ -57,7 +57,6 @@ use super::metrics::*;
 use super::local_metrics::{RaftMessageMetrics, RaftMetrics, RaftProposeMetrics, RaftReadyMetrics};
 
 const TRANSFER_LEADER_ALLOW_LOG_LAG: u64 = 10;
-const DEFAULT_APPEND_WB_SIZE: usize = 4 * 1024;
 
 struct ReadIndexRequest {
     id: u64,

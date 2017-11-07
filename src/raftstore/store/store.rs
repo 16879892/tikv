@@ -14,7 +14,6 @@
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver as StdReceiver, TryRecvError};
 use std::rc::Rc;
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::Bound::{Excluded, Included, Unbounded};
 use std::time::{Duration, Instant};
@@ -477,6 +476,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
 
         self.register_raft_base_tick(event_loop);
         self.register_raft_gc_log_tick(event_loop);
+        self.register_raft_gc_expried_files_tick(event_loop);
         self.register_split_region_check_tick(event_loop);
         self.register_compact_check_tick(event_loop);
         self.register_pd_store_heartbeat_tick(event_loop);
@@ -1302,13 +1302,13 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         // the size of current CompactLog command can be ignored.
         let remain_cnt = peer.last_applying_idx - state.get_index() - 1;
         peer.raft_log_size_hint = peer.raft_log_size_hint * remain_cnt / total_cnt;
-        let task = RaftlogGcTask {
-            raft_engine: peer.get_store().get_raft_engine().clone(),
-            region_id: peer.get_store().get_region_id(),
-            start_idx: peer.last_compacted_idx,
-            end_idx: state.get_index() + 1,
-        };
-        peer.last_compacted_idx = task.end_idx;
+        let task = RaftlogGcTask::region_task(
+            peer.get_store().get_raft_engine().clone(),
+            peer.get_store().get_region_id(),
+            peer.last_compacted_idx,
+            state.get_index() + 1,
+        );
+        peer.last_compacted_idx = state.get_index() + 1;
         if let Err(e) = self.raftlog_gc_worker.schedule(task) {
             error!(
                 "[region {}] failed to schedule compact task: {}",
@@ -1656,6 +1656,20 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         };
     }
 
+    fn register_raft_gc_expried_files_tick(&self, event_loop: &mut EventLoop<Self>) {
+        if let Err(e) = register_timer(
+            event_loop,
+            Tick::RaftLogExpiredFilesGc,
+            self.cfg.raft_log_gc_expired_files_tick_interval.as_millis(),
+        ) {
+            error!(
+                "{} register raft gc expired file tick err: {:?}",
+                self.tag,
+                e
+            );
+        };
+    }
+
     #[allow(if_same_then_else)]
     fn on_raft_gc_log_tick(&mut self, event_loop: &mut EventLoop<Self>) {
         let mut total_gc_logs = 0;
@@ -1738,6 +1752,14 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             .inc_by(total_gc_logs as f64)
             .unwrap();
         self.register_raft_gc_log_tick(event_loop);
+    }
+
+    fn on_raft_gc_expired_files_tick(&mut self, event_loop: &mut EventLoop<Self>) {
+        let task = RaftlogGcTask::engine_task(self.raft_engine.clone());
+        if let Err(e) = self.raftlog_gc_worker.schedule(task) {
+            error!("failed to schedule gc expired files task: {}", e);
+        }
+        self.register_raft_gc_expried_files_tick(event_loop);
     }
 
     fn register_split_region_check_tick(&self, event_loop: &mut EventLoop<Self>) {
@@ -2461,6 +2483,7 @@ impl<T: Transport, C: PdClient> mio::Handler for Store<T, C> {
         match timeout {
             Tick::Raft => self.on_raft_base_tick(event_loop),
             Tick::RaftLogGc => self.on_raft_gc_log_tick(event_loop),
+            Tick::RaftLogExpiredFilesGc => self.on_raft_gc_expired_files_tick(event_loop),
             Tick::SplitRegionCheck => self.on_split_region_check_tick(event_loop),
             Tick::CompactCheck => self.on_compact_check_tick(event_loop),
             Tick::PdHeartbeat => self.on_pd_heartbeat_tick(event_loop),

@@ -100,21 +100,21 @@ impl MemEntries {
     }
 
     pub fn get_value(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.kvs.get(key).map(|ref v| v.0.clone())
+        self.kvs.get(key).map(|v| v.0.clone())
     }
 
-    pub fn compact_to(&mut self, idx: u64) {
+    pub fn compact_to(&mut self, idx: u64) -> u64 {
         let cache_first_idx = match self.entry_queue.front() {
-            None => return,
+            None => return 0,
             Some(e) => e.get_index(),
         };
 
         if cache_first_idx >= idx {
-            return;
+            return 0;
         }
         let cache_last_idx = self.entry_queue.back().unwrap().get_index();
-        self.entry_queue
-            .drain(..(cmp::min(cache_last_idx, idx) - cache_first_idx) as usize);
+        let compact_count = cmp::min(cache_last_idx, idx) - cache_first_idx;
+        self.entry_queue.drain(..compact_count as usize);
 
         if self.entry_queue.len() < SHRINK_CACHE_CAPACITY &&
             self.entry_queue.capacity() > SHRINK_CACHE_CAPACITY
@@ -126,7 +126,7 @@ impl MemEntries {
             Some(e) => e.get_index(),
             None => {
                 self.file_index.clear();
-                return;
+                return compact_count;
             }
         };
 
@@ -136,6 +136,7 @@ impl MemEntries {
         if pos > 0 {
             self.file_index.drain(..pos);
         }
+        compact_count
     }
 
     pub fn fetch_entries_to(&self, begin: u64, end: u64, vec: &mut Vec<Entry>) -> Result<u64> {

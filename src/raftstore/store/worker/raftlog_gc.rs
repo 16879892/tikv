@@ -11,37 +11,68 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use raftstore::store::keys;
-use raftstore::store::engine::Iterable;
 use util::worker::Runnable;
-use raftengine::MultiRaftEngine as RaftEngine;
+use raftengine::{MultiRaftEngine as RaftEngine, Result as RaftEngineResult};
 
-use rocksdb::{Writable, WriteBatch, DB};
 use std::sync::Arc;
 use std::fmt::{self, Display, Formatter};
 use std::error;
 use std::sync::mpsc::Sender;
 
-pub struct Task {
+pub enum Task {
+    RegionTask(RegionTask),
+    EngineTask(EngineTask),
+}
+
+impl Task {
+    pub fn region_task(
+        raft_engine: Arc<RaftEngine>,
+        region_id: u64,
+        start_idx: u64,
+        end_idx: u64,
+    ) -> Task {
+        Task::RegionTask(RegionTask {
+            raft_engine: raft_engine,
+            region_id: region_id,
+            start_idx: start_idx,
+            end_idx: end_idx,
+        })
+    }
+
+    pub fn engine_task(raft_engine: Arc<RaftEngine>) -> Task {
+        Task::EngineTask(EngineTask {
+            raft_engine: raft_engine,
+        })
+    }
+}
+
+pub struct RegionTask {
     pub raft_engine: Arc<RaftEngine>,
     pub region_id: u64,
     pub start_idx: u64,
     pub end_idx: u64,
 }
 
-pub struct TaskRes {
+pub struct EngineTask {
+    pub raft_engine: Arc<RaftEngine>,
+}
+
+pub struct RegionTaskRes {
     pub collected: u64,
 }
 
 impl Display for Task {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(
-            f,
-            "GC Raft Log Task [region: {}, from: {}, to: {}]",
-            self.region_id,
-            self.start_idx,
-            self.end_idx
-        )
+        match *self {
+            Task::RegionTask(ref task) => write!(
+                f,
+                "GC Raft Log Task [region: {}, from: {}, to: {}]",
+                task.region_id,
+                task.start_idx,
+                task.end_idx
+            ),
+            Task::EngineTask(ref task) => write!(f, "GC raft engine expired files Task"),
+        }
     }
 }
 
@@ -58,24 +89,30 @@ quick_error! {
 }
 
 pub struct Runner {
-    ch: Option<Sender<TaskRes>>,
+    ch: Option<Sender<RegionTaskRes>>,
 }
 
 impl Runner {
-    pub fn new(ch: Option<Sender<TaskRes>>) -> Runner {
+    pub fn new(ch: Option<Sender<RegionTaskRes>>) -> Runner {
         Runner { ch: ch }
     }
 
     /// Do the gc job and return the count of log collected.
     fn gc_raft_log(
         &mut self,
-        mut raft_engine: Arc<RaftEngine>,
+        raft_engine: Arc<RaftEngine>,
         region_id: u64,
         start_idx: u64,
         end_idx: u64,
-    ) -> Result<u64, Error> {
-        raft_engine.compact_to(region_id, end_idx);
-        Ok(end_idx - start_idx)
+    ) -> u64 {
+        raft_engine.compact_to(region_id, end_idx)
+    }
+
+    fn gc_expired_files(&mut self, raft_engine: Arc<RaftEngine>) -> RaftEngineResult<()> {
+        if raft_engine.rewrite_inactive() {
+            raft_engine.sync_data()?;
+        }
+        raft_engine.purge_expired_files()
     }
 
     fn report_collected(&self, collected: u64) {
@@ -85,7 +122,7 @@ impl Runner {
         self.ch
             .as_ref()
             .unwrap()
-            .send(TaskRes {
+            .send(RegionTaskRes {
                 collected: collected,
             })
             .unwrap();
@@ -94,25 +131,20 @@ impl Runner {
 
 impl Runnable<Task> for Runner {
     fn run(&mut self, task: Task) {
-        debug!(
-            "[region {}] execute gc log to {}",
-            task.region_id,
-            task.end_idx
-        );
-        match self.gc_raft_log(
-            task.raft_engine,
-            task.region_id,
-            task.start_idx,
-            task.end_idx,
-        ) {
-            Err(e) => {
-                error!("[region {}] failed to gc: {:?}", task.region_id, e);
-                self.report_collected(0);
-            }
-            Ok(n) => {
+        match task {
+            Task::RegionTask(task) => {
+                let n = self.gc_raft_log(
+                    task.raft_engine,
+                    task.region_id,
+                    task.start_idx,
+                    task.end_idx,
+                );
                 debug!("[region {}] collected {} log entries", task.region_id, n);
                 self.report_collected(n);
             }
+            Task::EngineTask(task) => if let Err(e) = self.gc_expired_files(task.raft_engine) {
+                error!("GC expired files for raft engine error : {:?}", e);
+            },
         }
     }
 }

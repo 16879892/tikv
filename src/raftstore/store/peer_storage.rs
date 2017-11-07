@@ -14,11 +14,9 @@
 use std::sync::{self, Arc};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::rc::Rc;
 use std::cell::RefCell;
-use std::{cmp, error, u64};
+use std::{error, u64};
 use std::time::Instant;
-use std::collections::VecDeque;
 
 use rocksdb::{Writable, WriteBatch, DB};
 use protobuf::Message;
@@ -28,12 +26,12 @@ use kvproto::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use kvproto::raft_serverpb::{PeerState, RaftApplyState, RaftLocalState, RaftSnapshotData,
                              RegionLocalState};
 use util::worker::Scheduler;
-use util::{self, rocksdb};
+use util::rocksdb;
 use raft::{self, Error as RaftError, RaftState, Ready, Storage, StorageError};
 use raftstore::{Error, Result};
 use super::worker::RegionTask;
 use super::keys::{self, enc_end_key, enc_start_key};
-use super::engine::{Iterable, Mutable, Peekable, Snapshot as DbSnapshot};
+use super::engine::{Mutable, Peekable, Snapshot as DbSnapshot};
 use super::peer::ReadyContext;
 use super::metrics::*;
 use super::{SnapEntry, SnapKey, SnapManager, SnapshotStatistics};
@@ -45,11 +43,6 @@ use raftengine::{LogBatch, MultiRaftEngine as RaftEngine};
 pub const RAFT_INIT_LOG_TERM: u64 = 5;
 pub const RAFT_INIT_LOG_INDEX: u64 = 5;
 const MAX_SNAP_TRY_CNT: usize = 5;
-const RAFT_LOG_MULTI_GET_CNT: u64 = 8;
-
-// One extra slot for VecDeque internal usage.
-const MAX_CACHE_CAPACITY: usize = 1024 - 1;
-const SHRINK_CACHE_CAPACITY: usize = 64;
 
 pub const JOB_STATUS_PENDING: usize = 0;
 pub const JOB_STATUS_RUNNING: usize = 1;
@@ -268,7 +261,7 @@ pub fn recover_from_applying_state(
     Ok(())
 }
 
-fn init_raft_state(raft_engine: &mut RaftEngine, region: &Region) -> Result<RaftLocalState> {
+fn init_raft_state(raft_engine: &RaftEngine, region: &Region) -> Result<RaftLocalState> {
     let state_key = keys::raft_state_key(region.get_id());
     Ok(match raft_engine.get_msg(region.get_id(), &state_key)? {
         Some(s) => s,
@@ -341,13 +334,13 @@ fn init_last_term(
 impl PeerStorage {
     pub fn new(
         kv_engine: Arc<DB>,
-        mut raft_engine: Arc<RaftEngine>,
+        raft_engine: Arc<RaftEngine>,
         region: &metapb::Region,
         region_sched: Scheduler<RegionTask>,
         tag: String,
     ) -> Result<PeerStorage> {
         debug!("creating storage on {} for {:?}", kv_engine.path(), region);
-        let raft_state = init_raft_state(&mut raft_engine, region)?;
+        let raft_state = init_raft_state(&raft_engine, region)?;
         let apply_state = init_apply_state(&kv_engine, region)?;
         if raft_state.get_last_index() < apply_state.get_applied_index() {
             panic!(
@@ -985,6 +978,12 @@ pub fn clear_meta(
     kv_wb.delete_cf(handle, &keys::apply_state_key(region_id))?;
 
     raft_wb.clean_region(region_id);
+
+    info!(
+        "[region {}] clear peer 1 meta key, 1 apply key, 1 raft key and all raft logs, takes {:?}",
+        region_id,
+        t.elapsed()
+    );
 
     Ok(())
 }

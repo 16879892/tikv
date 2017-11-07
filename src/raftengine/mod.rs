@@ -58,3 +58,4 @@ pub type Result<T> = ::std::result::Result<T, Error>;
 
 pub use self::engine::{MultiRaftEngine, RecoveryMode};
 pub use self::log_batch::LogBatch;
+pub use self::pipe_log::{DEFAULT_BYTES_PER_SYNC, DEFAULT_LOG_MAX_SIZE};

@@ -15,8 +15,10 @@ const FILE_NAME_LEN: usize = FILE_NUM_LEN + LOG_SUFFIX_LEN;
 pub const FILE_MAGIC_HEADER: &'static [u8] = b"RAFT-LOG-FILE-HEADER";
 pub const VERSION: &'static [u8] = b"v1.0.0";
 const INIT_FILE_NUM: u64 = 1;
-const MB: usize = 1024 * 1024;
-const LOG_MAX_SIZE: usize = 128 * MB;
+const KB: usize = 1024;
+const MB: usize = KB * KB;
+pub const DEFAULT_BYTES_PER_SYNC: usize = 32 * KB;
+pub const DEFAULT_LOG_MAX_SIZE: usize = 128 * MB;
 
 pub struct PipeLog {
     first_file_num: u64,
@@ -113,7 +115,7 @@ impl PipeLog {
         self.active_log_size += content.len();
         if sync ||
             self.bytes_per_sync > 0 &&
-                self.active_log_size - self.active_log_size >= self.bytes_per_sync
+                self.active_log_size - self.last_sync_size >= self.bytes_per_sync
         {
             self.active_log.as_mut().unwrap().sync_data()?;
             self.last_sync_size = self.active_log_size;
@@ -174,6 +176,11 @@ impl PipeLog {
         self.active_log_size = offset as usize;
         self.last_sync_size = self.active_log_size;
 
+        Ok(())
+    }
+
+    pub fn sync_data(&mut self) -> Result<()> {
+        self.active_log.as_mut().unwrap().sync_data()?;
         Ok(())
     }
 

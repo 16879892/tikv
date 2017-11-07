@@ -26,6 +26,8 @@ use tikv::raftstore::{Error, Result};
 use tikv::raftstore::store::*;
 use tikv::config::TiKvConfig;
 use tikv::storage::{ALL_CFS, CF_DEFAULT};
+use tikv::raftengine::{MultiRaftEngine as RaftEngine, RecoveryMode, DEFAULT_BYTES_PER_SYNC,
+                       DEFAULT_LOG_MAX_SIZE};
 use super::util::*;
 use kvproto::pdpb;
 use kvproto::raft_cmdpb::*;
@@ -126,9 +128,12 @@ impl<T: Simulator> Cluster<T> {
                 rocksdb::new_engine(item.path().to_str().unwrap(), &kv_cfs).unwrap(),
             );
             let raft_path = item.path().join(Path::new("raft"));
-            let raft_engine = Arc::new(
-                rocksdb::new_engine(raft_path.to_str().unwrap(), &[CF_DEFAULT]).unwrap(),
-            );
+            let raft_engine = Arc::new(RaftEngine::new(
+                raft_path.to_str().unwrap(),
+                RecoveryMode::TolerateCorruptedTailRecords,
+                DEFAULT_BYTES_PER_SYNC,
+                DEFAULT_LOG_MAX_SIZE,
+            ));
             self.dbs.push(Engines::new(engine, raft_engine));
         }
     }

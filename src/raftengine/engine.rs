@@ -15,8 +15,6 @@ use super::mem_entries::MemEntries;
 use super::pipe_log::{PipeLog, FILE_MAGIC_HEADER, VERSION};
 use super::log_batch::{Command, LogBatch, LogItemType, OpType};
 
-const DEFAULT_BYTES_PER_SYNC: usize = 32 * 1024;
-
 const SLOTS_COUNT: usize = 32;
 
 #[derive(Clone, Copy)]
@@ -32,11 +30,6 @@ pub struct MultiRaftEngine {
     // Multiple slots
     // region_id -> MemEntries.
     pub mem_entries: Vec<RwLock<HashMap<u64, MemEntries>>>,
-
-    // Rewrite inactive region's entries to new pipe log file,
-    // so the old log file can be dropped.
-    // Rewrite one slot for each time.
-    next_rewrite_slot: usize,
 
     // Persistent entries.
     pub pipe_log: RwLock<PipeLog>,
@@ -58,7 +51,6 @@ impl MultiRaftEngine {
         let mut engine = MultiRaftEngine {
             dir: String::from(dir),
             mem_entries: mem_entries,
-            next_rewrite_slot: 0,
             pipe_log: RwLock::new(pip_log),
         };
         engine
@@ -156,71 +148,52 @@ impl MultiRaftEngine {
     }
 
     // Rewrite inactive region's entries and key/value pairs, so the old log can be dropped.
-    pub fn rewrite_inactive(&mut self) {
+    pub fn rewrite_inactive(&self) -> bool {
         let active_file_num = {
             let pipe_log = self.pipe_log.read().unwrap();
             pipe_log.active_file_num()
         };
 
-        let mut mem_entries = self.mem_entries[self.next_rewrite_slot].write().unwrap();
-        for entries in mem_entries.values_mut() {
-            let max_file_num = match entries.max_file_num() {
-                Some(file_num) => file_num,
-                None => continue,
-            };
-            let count = entries.entry_queue.len();
-            if count > 0 && count <= 50 && max_file_num + 8 < active_file_num {
-                // Rewrite entries
-                let mut ents = Vec::with_capacity(count);
-                entries.fetch_all(&mut ents);
-                let mut log_batch = LogBatch::default();
-                log_batch.add_entries(entries.region_id, ents.clone());
+        let mut has_write = false;
+        for slot in 0..SLOTS_COUNT {
+            let mut mem_entries = self.mem_entries[slot].write().unwrap();
+            for entries in mem_entries.values_mut() {
+                let max_file_num = match entries.max_file_num() {
+                    Some(file_num) => file_num,
+                    None => continue,
+                };
+                let count = entries.entry_queue.len();
+                if count > 0 && count <= 50 && max_file_num + 8 < active_file_num {
+                    // Rewrite entries
+                    has_write = true;
+                    let mut ents = Vec::with_capacity(count);
+                    entries.fetch_all(&mut ents);
+                    let mut log_batch = LogBatch::default();
+                    log_batch.add_entries(entries.region_id, ents.clone());
 
-                let mut kvs = vec![];
-                entries.fetch_all_kvs(&mut kvs);
-                for kv in &kvs {
-                    log_batch.put_value(entries.region_id, &kv.0, &kv.1);
-                }
-                {
-                    let mut pipe_log = self.pipe_log.write().unwrap();
-                    match pipe_log.append_log_batch(&log_batch, false) {
-                        Ok(file_num) => for item in log_batch.items.drain(..) {
-                            match item.item_type {
-                                LogItemType::Entries => {
-                                    let ents = item.entries.unwrap();
-                                    assert_eq!(ents.region_id, entries.region_id);
-                                    entries.append(ents.entries, file_num);
-                                }
-                                LogItemType::KV => {
-                                    let kv = item.kv.unwrap();
-                                    assert_eq!(kv.region_id, entries.region_id);
-                                    match kv.op_type {
-                                        OpType::Put => {
-                                            entries.put_kv(kv.key, kv.value.unwrap(), file_num);
-                                        }
-                                        OpType::Del => {
-                                            panic!("No delete kv type in memory");
-                                        }
-                                    }
-                                }
-                                LogItemType::CMD => {
-                                    panic!("No command in memory");
-                                }
+                    let mut kvs = vec![];
+                    entries.fetch_all_kvs(&mut kvs);
+                    for kv in &kvs {
+                        log_batch.put_value(entries.region_id, &kv.0, &kv.1);
+                    }
+                    {
+                        let mut pipe_log = self.pipe_log.write().unwrap();
+                        match pipe_log.append_log_batch(&log_batch, false) {
+                            Ok(file_num) => self.post_append_to_file(log_batch, file_num),
+                            Err(e) => {
+                                panic!("Rewrite inactive region entries failed. error {:?}", e)
                             }
-                        },
-                        Err(e) => panic!("Rewrite inactive region entries failed. error {:?}", e),
+                        }
                     }
                 }
             }
         }
-
-        self.next_rewrite_slot += 1;
-        self.next_rewrite_slot %= SLOTS_COUNT;
+        has_write
     }
 
-    pub fn purge_expired_file(&mut self) -> Result<()> {
+    pub fn purge_expired_files(&self) -> Result<()> {
         let mut min_file_num = u64::MAX;
-        for mem_entries in &mut self.mem_entries {
+        for mem_entries in &self.mem_entries {
             let mem_entries = mem_entries.read().unwrap();
             let file_num = mem_entries.values().fold(u64::MAX, |min, x| {
                 cmp::min(min, x.min_file_num().map_or(u64::MAX, |num| num))
@@ -234,16 +207,18 @@ impl MultiRaftEngine {
         pipe_log.purge_to(min_file_num)
     }
 
-    pub fn compact_to(&mut self, region_id: u64, index: u64) {
+    pub fn compact_to(&self, region_id: u64, index: u64) -> u64 {
         let mut mem_entries = self.mem_entries[region_id as usize % SLOTS_COUNT]
             .write()
             .unwrap();
         if let Some(cache) = mem_entries.get_mut(&region_id) {
-            cache.compact_to(index);
+            cache.compact_to(index)
+        } else {
+            0
         }
     }
 
-    pub fn write(&mut self, log_batch: LogBatch, sync: bool) -> Result<()> {
+    pub fn write(&self, log_batch: LogBatch, sync: bool) -> Result<()> {
         let write_res = {
             let mut pipe_log = self.pipe_log.write().unwrap();
             pipe_log.append_log_batch(&log_batch, sync)
@@ -255,6 +230,11 @@ impl MultiRaftEngine {
             }
             Err(e) => panic!("Append log batch to pipe log failed, error: {:?}", e),
         }
+    }
+
+    pub fn sync_data(&self) -> Result<()> {
+        let mut pipe_log = self.pipe_log.write().unwrap();
+        pipe_log.sync_data()
     }
 
     pub fn get_value(&self, region_id: u64, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -314,7 +294,7 @@ impl MultiRaftEngine {
         }
     }
 
-    pub fn clean_region(&mut self, region_id: u64) -> Result<()> {
+    pub fn clean_region(&self, region_id: u64) -> Result<()> {
         let mut log_batch = LogBatch::default();
         log_batch.clean_region(region_id);
         self.write(log_batch, true)
@@ -330,14 +310,14 @@ impl MultiRaftEngine {
         true
     }
 
-    fn post_append_to_file(&mut self, log_batch: LogBatch, file_num: u64) {
+    fn post_append_to_file(&self, log_batch: LogBatch, file_num: u64) {
         if file_num == 0 {
             return;
         }
         self.apply_to_cache(log_batch, file_num);
     }
 
-    fn apply_to_cache(&mut self, mut log_batch: LogBatch, file_num: u64) {
+    fn apply_to_cache(&self, mut log_batch: LogBatch, file_num: u64) {
         for item in log_batch.items.drain(..) {
             match item.item_type {
                 LogItemType::Entries => {

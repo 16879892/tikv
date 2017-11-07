@@ -52,6 +52,8 @@ use tikv::raftstore::store::{keys, Engines};
 use tikv::raftstore::store::debug::{Debugger, RegionInfo};
 use tikv::storage::{ALL_CFS, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use tikv::pd::{PdClient, RpcClient};
+use tikv::raftengine::{MultiRaftEngine as RaftEngine, RecoveryMode, DEFAULT_BYTES_PER_SYNC,
+                       DEFAULT_LOG_MAX_SIZE};
 
 fn perror_and_exit<E: Error>(prefix: &str, e: E) -> ! {
     eprintln!("{}: {}", prefix, e);
@@ -67,10 +69,20 @@ fn new_debug_executor(
         (None, Some(kv_path)) => {
             let db = util::rocksdb::open(kv_path, ALL_CFS).unwrap();
             let raft_db = if let Some(raft_path) = raft_db {
-                util::rocksdb::open(raft_path, &[CF_DEFAULT]).unwrap()
+                RaftEngine::new(
+                    raft_path,
+                    RecoveryMode::TolerateCorruptedTailRecords,
+                    DEFAULT_BYTES_PER_SYNC,
+                    DEFAULT_LOG_MAX_SIZE,
+                )
             } else {
                 let raft_path = PathBuf::from(kv_path).join("../raft");
-                util::rocksdb::open(raft_path.to_str().unwrap(), &[CF_DEFAULT]).unwrap()
+                RaftEngine::new(
+                    raft_path.to_str().unwrap(),
+                    RecoveryMode::TolerateCorruptedTailRecords,
+                    DEFAULT_BYTES_PER_SYNC,
+                    DEFAULT_LOG_MAX_SIZE,
+                )
             };
             Box::new(Debugger::new(Engines::new(Arc::new(db), Arc::new(raft_db)))) as
                 Box<DebugExecutor>
