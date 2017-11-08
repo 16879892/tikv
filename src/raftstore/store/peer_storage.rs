@@ -1166,20 +1166,25 @@ mod test {
     use storage::{ALL_CFS, CF_DEFAULT};
     use kvproto::eraftpb::HardState;
     use rocksdb::WriteBatch;
+    use raftstore::store::engine::Iterable;
+    use raftengine::{LogBatch, MultiRaftEngine as RaftEngine, RecoveryMode,
+                     DEFAULT_BYTES_PER_SYNC, DEFAULT_LOG_MAX_SIZE};
 
     use super::*;
 
     fn new_storage(sched: Scheduler<RegionTask>, path: &TempDir) -> PeerStorage {
         let kv_db = Arc::new(new_engine(path.path().to_str().unwrap(), ALL_CFS).unwrap());
         let raft_path = path.path().join(Path::new("raft"));
-        let raft_db = Arc::new(
-            new_engine(raft_path.to_str().unwrap(), &[CF_DEFAULT]).unwrap(),
-        );
+        let raft_db = Arc::new(RaftEngine::new(
+            raft_path.to_str().unwrap(),
+            RecoveryMode::TolerateCorruptedTailRecords,
+            DEFAULT_BYTES_PER_SYNC,
+            DEFAULT_LOG_MAX_SIZE,
+        ));
         let engines = Engines::new(kv_db.clone(), raft_db.clone());
         bootstrap::bootstrap_store(&engines, 1, 1).expect("");
         let region = bootstrap::prepare_bootstrap(&engines, 1, 1, 1).expect("");
-        let metrics = Rc::new(RefCell::new(CacheQueryStats::default()));
-        PeerStorage::new(kv_db, raft_db, &region, sched, "".to_owned(), metrics).unwrap()
+        PeerStorage::new(kv_db, raft_db, &region, sched, "".to_owned()).unwrap()
     }
 
     fn new_storage_from_ents(
@@ -1206,7 +1211,7 @@ mod test {
             .set_applied_index(ents.last().unwrap().get_index());
         ctx.save_apply_state_to(&store.kv_engine, &mut kv_wb)
             .unwrap();
-        store.raft_engine.write(ready_ctx.raft_wb).expect("");
+        store.raft_engine.write(ready_ctx.raft_wb, false).expect("");
         store.kv_engine.write(kv_wb).expect("");
         store.raft_state = ctx.raft_state;
         store.apply_state = ctx.apply_state;
@@ -1220,19 +1225,8 @@ mod test {
         let mut ready_ctx = ReadyContext::new(&mut metrics, &trans, ents.len());
         store.append(&mut ctx, ents, &mut ready_ctx).unwrap();
         ctx.save_raft_state_to(&mut ready_ctx.raft_wb).unwrap();
-        store.raft_engine.write(ready_ctx.raft_wb).expect("");
+        store.raft_engine.write(ready_ctx.raft_wb, false).expect("");
         store.raft_state = ctx.raft_state;
-    }
-
-    fn validate_cache(store: &PeerStorage, exp_ents: &[Entry]) {
-        assert_eq!(store.cache.cache, exp_ents);
-        for e in exp_ents {
-            let key = keys::raft_log_key(store.get_region_id(), e.get_index());
-            let bytes = store.raft_engine.get(&key).unwrap().unwrap();
-            let mut entry = Entry::new();
-            entry.merge_from_bytes(&bytes).unwrap();
-            assert_eq!(entry, *e);
-        }
     }
 
     fn new_entry(index: u64, term: u64) -> Entry {
@@ -1294,14 +1288,7 @@ mod test {
                 Ok(true)
             })
             .unwrap();
-
-        store
-            .raft_engine
-            .scan(&raft_start, &raft_end, false, &mut |_, _| {
-                count += 1;
-                Ok(true)
-            })
-            .unwrap();
+        count += store.raft_engine.kv_count(region_id);
 
         count
     }
@@ -1317,10 +1304,10 @@ mod test {
         assert_eq!(6, get_meta_key_count(&store));
 
         let kv_wb = WriteBatch::new();
-        let raft_wb = WriteBatch::new();
-        store.clear_meta(&kv_wb, &raft_wb).unwrap();
+        let mut raft_wb = LogBatch::default();
+        store.clear_meta(&kv_wb, &mut raft_wb).unwrap();
         store.kv_engine.write(kv_wb).unwrap();
-        store.raft_engine.write(raft_wb).unwrap();
+        store.raft_engine.write(raft_wb, false).unwrap();
 
         assert_eq!(0, get_meta_key_count(&store));
     }
@@ -1492,7 +1479,7 @@ mod test {
         ctx.save_raft_state_to(&mut ready_ctx.raft_wb).unwrap();
         ctx.save_apply_state_to(&s.kv_engine, &mut kv_wb).unwrap();
         s.kv_engine.write(kv_wb).unwrap();
-        s.raft_engine.write(ready_ctx.raft_wb).unwrap();
+        s.raft_engine.write(ready_ctx.raft_wb, false).unwrap();
         s.apply_state = ctx.apply_state;
         s.raft_state = ctx.raft_state;
         ctx = InvokeContext::new(&s);
@@ -1587,129 +1574,6 @@ mod test {
     }
 
     #[test]
-    fn test_storage_cache_fetch() {
-        let ents = vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)];
-        let td = TempDir::new("tikv-store-test").unwrap();
-        let worker = Worker::new("snap_manager");
-        let sched = worker.scheduler();
-        let mut store = new_storage_from_ents(sched, &td, &ents);
-        store.cache.cache.clear();
-        // empty cache should fetch data from rocksdb directly.
-        let mut res = store.entries(4, 6, u64::max_value()).unwrap();
-        assert_eq!(*res, ents[1..]);
-
-        let entries = vec![new_entry(6, 5), new_entry(7, 5)];
-        append_ents(&mut store, &entries);
-        validate_cache(&store, &entries);
-
-        // direct cache access
-        res = store.entries(6, 8, u64::max_value()).unwrap();
-        assert_eq!(res, entries);
-
-        // size limit should be supported correctly.
-        res = store.entries(4, 8, 0).unwrap();
-        assert_eq!(res, vec![new_entry(4, 4)]);
-        let mut size = ents[1..].iter().map(|e| e.compute_size() as u64).sum();
-        res = store.entries(4, 8, size).unwrap();
-        let mut exp_res = ents[1..].to_vec();
-        assert_eq!(res, exp_res);
-        for e in &entries {
-            size += e.compute_size() as u64;
-            exp_res.push(e.clone());
-            res = store.entries(4, 8, size).unwrap();
-            assert_eq!(res, exp_res);
-        }
-
-        // range limit should be supported correctly.
-        for low in 4..9 {
-            for high in low..9 {
-                let res = store.entries(low, high, u64::max_value()).unwrap();
-                assert_eq!(*res, exp_res[low as usize - 4..high as usize - 4]);
-            }
-        }
-    }
-
-    #[test]
-    fn test_storage_cache_update() {
-        let ents = vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)];
-        let td = TempDir::new("tikv-store-test").unwrap();
-        let worker = Worker::new("snap_manager");
-        let sched = worker.scheduler();
-        let mut store = new_storage_from_ents(sched, &td, &ents);
-        store.cache.cache.clear();
-
-        // initial cache
-        let mut entries = vec![new_entry(6, 5), new_entry(7, 5)];
-        append_ents(&mut store, &entries);
-        validate_cache(&store, &entries);
-
-        // rewrite
-        entries = vec![new_entry(6, 6), new_entry(7, 6)];
-        append_ents(&mut store, &entries);
-        validate_cache(&store, &entries);
-
-        // rewrite old entry
-        entries = vec![new_entry(5, 6), new_entry(6, 6)];
-        append_ents(&mut store, &entries);
-        validate_cache(&store, &entries);
-
-        // partial rewrite
-        entries = vec![new_entry(6, 7), new_entry(7, 7)];
-        append_ents(&mut store, &entries);
-        let mut exp_res = vec![new_entry(5, 6), new_entry(6, 7), new_entry(7, 7)];
-        validate_cache(&store, &exp_res);
-
-        // direct append
-        entries = vec![new_entry(8, 7), new_entry(9, 7)];
-        append_ents(&mut store, &entries);
-        exp_res.extend_from_slice(&entries);
-        validate_cache(&store, &exp_res);
-
-        // rewrite middle
-        entries = vec![new_entry(7, 8)];
-        append_ents(&mut store, &entries);
-        exp_res.truncate(2);
-        exp_res.push(new_entry(7, 8));
-        validate_cache(&store, &exp_res);
-
-        let cap = MAX_CACHE_CAPACITY as u64;
-
-        // result overflow
-        entries = (3..cap + 1).map(|i| new_entry(i + 5, 8)).collect();
-        append_ents(&mut store, &entries);
-        exp_res.remove(0);
-        exp_res.extend_from_slice(&entries);
-        validate_cache(&store, &exp_res);
-
-        // input overflow
-        entries = (0..cap + 1).map(|i| new_entry(i + cap + 6, 8)).collect();
-        append_ents(&mut store, &entries);
-        exp_res = entries[entries.len() - cap as usize..].to_vec();
-        validate_cache(&store, &exp_res);
-
-        // compact
-        store.compact_to(cap + 10);
-        exp_res = (cap + 10..cap * 2 + 7).map(|i| new_entry(i, 8)).collect();
-        validate_cache(&store, &exp_res);
-
-        // compact shrink
-        assert!(store.cache.cache.capacity() >= cap as usize);
-        store.compact_to(cap * 2);
-        exp_res = (cap * 2..cap * 2 + 7).map(|i| new_entry(i, 8)).collect();
-        validate_cache(&store, &exp_res);
-        assert!(store.cache.cache.capacity() < cap as usize);
-
-        // append shrink
-        entries = (0..cap + 1).map(|i| new_entry(i, 8)).collect();
-        append_ents(&mut store, &entries);
-        assert!(store.cache.cache.capacity() >= cap as usize);
-        append_ents(&mut store, &[new_entry(6, 8)]);
-        exp_res = (1..7).map(|i| new_entry(i, 8)).collect();
-        validate_cache(&store, &exp_res);
-        assert!(store.cache.cache.capacity() < cap as usize);
-    }
-
-    #[test]
     fn test_storage_apply_snapshot() {
         let ents = vec![
             new_entry(3, 3),
@@ -1743,8 +1607,8 @@ mod test {
         let mut ctx = InvokeContext::new(&s2);
         assert_ne!(ctx.last_term, snap1.get_metadata().get_term());
         let kv_wb = WriteBatch::new();
-        let raft_wb = WriteBatch::new();
-        s2.apply_snapshot(&mut ctx, &snap1, &kv_wb, &raft_wb)
+        let mut raft_wb = LogBatch::default();
+        s2.apply_snapshot(&mut ctx, &snap1, &kv_wb, &mut raft_wb)
             .unwrap();
         assert_eq!(ctx.last_term, snap1.get_metadata().get_term());
         assert_eq!(ctx.apply_state.get_applied_index(), 6);
@@ -1752,24 +1616,21 @@ mod test {
         assert_eq!(ctx.apply_state.get_truncated_state().get_index(), 6);
         assert_eq!(ctx.apply_state.get_truncated_state().get_term(), 6);
         assert_eq!(s2.first_index(), s2.applied_index() + 1);
-        validate_cache(&s2, &[]);
 
         let td3 = TempDir::new("tikv-store-test").unwrap();
         let ents = &[new_entry(3, 3), new_entry(4, 3)];
         let mut s3 = new_storage_from_ents(sched, &td3, ents);
-        validate_cache(&s3, &ents[1..]);
         let mut ctx = InvokeContext::new(&s3);
         assert_ne!(ctx.last_term, snap1.get_metadata().get_term());
         let kv_wb = WriteBatch::new();
-        let raft_wb = WriteBatch::new();
-        s3.apply_snapshot(&mut ctx, &snap1, &kv_wb, &raft_wb)
+        let mut raft_wb = LogBatch::default();
+        s3.apply_snapshot(&mut ctx, &snap1, &kv_wb, &mut raft_wb)
             .unwrap();
         assert_eq!(ctx.last_term, snap1.get_metadata().get_term());
         assert_eq!(ctx.apply_state.get_applied_index(), 6);
         assert_eq!(ctx.raft_state.get_last_index(), 6);
         assert_eq!(ctx.apply_state.get_truncated_state().get_index(), 6);
         assert_eq!(ctx.apply_state.get_truncated_state().get_term(), 6);
-        validate_cache(&s3, &[]);
     }
 
     #[test]

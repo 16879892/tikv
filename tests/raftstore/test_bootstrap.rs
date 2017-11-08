@@ -24,6 +24,9 @@ use tempdir::TempDir;
 use kvproto::metapb;
 use kvproto::raft_serverpb::RegionLocalState;
 
+use tikv::raftengine::{MultiRaftEngine as RaftEngine, RecoveryMode, DEFAULT_BYTES_PER_SYNC,
+                       DEFAULT_LOG_MAX_SIZE};
+
 use super::pd::{bootstrap_with_first_region, TestPdClient};
 use super::cluster::{Cluster, Simulator};
 use super::node::{new_node_cluster, ChannelTransport};
@@ -57,9 +60,12 @@ fn test_node_bootstrap_with_prepared_data() {
         rocksdb::new_engine(tmp_path.path().to_str().unwrap(), ALL_CFS).unwrap(),
     );
     let tmp_path_raft = tmp_path.path().join(Path::new("raft"));
-    let raft_engine = Arc::new(
-        rocksdb::new_engine(tmp_path_raft.to_str().unwrap(), &[]).unwrap(),
-    );
+    let raft_engine = Arc::new(RaftEngine::new(
+        tmp_path_raft.to_str().unwrap(),
+        RecoveryMode::TolerateCorruptedTailRecords,
+        DEFAULT_BYTES_PER_SYNC,
+        DEFAULT_LOG_MAX_SIZE,
+    ));
     let engines = Engines::new(engine.clone(), raft_engine.clone());
     let tmp_mgr = TempDir::new("test_cluster").unwrap();
 

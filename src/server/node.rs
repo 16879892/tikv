@@ -225,7 +225,7 @@ where
 
     pub fn prepare_bootstrap_cluster(
         &self,
-        engines: &mut Engines,
+        engines: &Engines,
         store_id: u64,
     ) -> Result<metapb::Region> {
         let region_id = self.alloc_id()?;

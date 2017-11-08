@@ -155,68 +155,61 @@ mod test {
     use std::time::Duration;
     use util::rocksdb::new_engine;
     use tempdir::TempDir;
+
+    use kvproto::eraftpb::Entry;
+
     use storage::CF_DEFAULT;
+    use raftengine::{LogBatch, MultiRaftEngine as RaftEngine, RecoveryMode,
+                     DEFAULT_BYTES_PER_SYNC, DEFAULT_LOG_MAX_SIZE};
     use super::*;
 
     #[test]
     fn test_gc_raft_log() {
         let path = TempDir::new("gc-raft-log-test").unwrap();
-        let raft_db = new_engine(path.path().to_str().unwrap(), &[CF_DEFAULT]).unwrap();
-        let raft_db = Arc::new(raft_db);
+        let raft_engine = RaftEngine::new(
+            path.path().to_str().unwrap(),
+            RecoveryMode::TolerateCorruptedTailRecords,
+            DEFAULT_BYTES_PER_SYNC,
+            DEFAULT_LOG_MAX_SIZE,
+        );
+        let raft_engine = Arc::new(raft_engine);
 
         let (tx, rx) = mpsc::channel();
         let mut runner = Runner::new(Some(tx));
 
         // generate raft logs
         let region_id = 1;
-        let raft_wb = WriteBatch::new();
+        let mut ents = vec![];
         for i in 0..100 {
-            let k = keys::raft_log_key(region_id, i);
-            raft_wb.put(&k, b"entry").unwrap();
+            let mut e = Entry::new();
+            e.set_index(i);
+            ents.push(e);
         }
-        raft_db.write(raft_wb).unwrap();
+        let mut log_batch = LogBatch::default();
+        log_batch.add_entries(region_id, ents);
+        raft_engine.write(log_batch, false).unwrap();
 
         let tbls = vec![
             (
-                Task {
-                    raft_engine: raft_db.clone(),
-                    region_id: region_id,
-                    start_idx: 0,
-                    end_idx: 10,
-                },
+                Task::region_task(raft_engine.clone(), region_id, 0, 10),
                 10,
                 (0, 10),
                 (10, 100),
             ),
             (
-                Task {
-                    raft_engine: raft_db.clone(),
-                    region_id: region_id,
-                    start_idx: 0,
-                    end_idx: 50,
-                },
+                Task::region_task(raft_engine.clone(), region_id, 0, 50),
                 40,
                 (0, 50),
                 (50, 100),
             ),
             (
-                Task {
-                    raft_engine: raft_db.clone(),
-                    region_id: region_id,
-                    start_idx: 50,
-                    end_idx: 50,
-                },
+                Task::region_task(raft_engine.clone(), region_id, 50, 50),
                 0,
                 (0, 50),
                 (50, 100),
             ),
             (
-                Task {
-                    raft_engine: raft_db.clone(),
-                    region_id: region_id,
-                    start_idx: 50,
-                    end_idx: 60,
-                },
+                Task::region_task(raft_engine.clone(), region_id, 50, 60),
                 10,
                 (0, 60),
                 (60, 100),
@@ -227,22 +220,31 @@ mod test {
             runner.run(task);
             let res = rx.recv_timeout(Duration::from_secs(3)).unwrap();
             assert_eq!(res.collected, expected_collectd);
-            raft_log_must_not_exist(&raft_db, 1, not_exist_range.0, not_exist_range.1);
-            raft_log_must_exist(&raft_db, 1, exist_range.0, exist_range.1);
+            raft_log_must_not_exist(&raft_engine, 1, not_exist_range.0, not_exist_range.1);
+            raft_log_must_exist(&raft_engine, 1, exist_range.0, exist_range.1);
         }
     }
 
-    fn raft_log_must_not_exist(raft_engine: &DB, region_id: u64, start_idx: u64, end_idx: u64) {
-        for i in start_idx..end_idx {
-            let k = keys::raft_log_key(region_id, i);
-            assert!(raft_engine.get(&k).unwrap().is_none());
-        }
+    fn raft_log_must_not_exist(
+        raft_engine: &RaftEngine,
+        region_id: u64,
+        start_idx: u64,
+        end_idx: u64,
+    ) {
+        let mut vec = vec![];
+        assert!(
+            raft_engine
+                .fetch_entries_to(region_id, start_idx, end_idx, &mut vec)
+                .is_err()
+        );
     }
 
-    fn raft_log_must_exist(raft_engine: &DB, region_id: u64, start_idx: u64, end_idx: u64) {
-        for i in start_idx..end_idx {
-            let k = keys::raft_log_key(region_id, i);
-            assert!(raft_engine.get(&k).unwrap().is_some());
-        }
+    fn raft_log_must_exist(raft_engine: &RaftEngine, region_id: u64, start_idx: u64, end_idx: u64) {
+        let mut vec = vec![];
+        raft_engine
+            .fetch_entries_to(region_id, start_idx, end_idx, &mut vec)
+            .unwrap();
+        assert_eq!(vec.len(), (end_idx - start_idx) as usize);
+
     }
 }

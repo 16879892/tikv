@@ -83,6 +83,7 @@ fn test_serde_custom_tikv_config() {
         raft_max_inflight_msgs: 123,
         raft_entry_max_size: ReadableSize::mb(12),
         raft_log_gc_tick_interval: ReadableDuration::secs(12),
+        raft_log_gc_expired_files_tick_interval: ReadableDuration::secs(33),
         raft_log_gc_threshold: 12,
         raft_log_gc_count_limit: 12,
         raft_log_gc_size_limit: ReadableSize::kb(1),

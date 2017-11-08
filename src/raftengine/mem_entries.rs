@@ -361,12 +361,12 @@ mod tests {
         // add kvs
         let (k1, v1) = (b"key1", b"value1");
         let (k5, v5) = (b"key5", b"value5");
-        mem_entries.add_kv(k1.to_vec(), v1.to_vec(), 1);
-        mem_entries.add_kv(k5.to_vec(), v5.to_vec(), 5);
+        mem_entries.put_kv(k1.to_vec(), v1.to_vec(), 1);
+        mem_entries.put_kv(k5.to_vec(), v5.to_vec(), 5);
         assert_eq!(mem_entries.min_file_num().unwrap(), 1);
         assert_eq!(mem_entries.max_file_num().unwrap(), 5);
-        assert_eq!(mem_entries.get_kv(k1.as_ref()), Some(v1.as_ref()));
-        assert_eq!(mem_entries.get_kv(k5.as_ref()), Some(v5.as_ref()));
+        assert_eq!(mem_entries.get_value(k1.as_ref()), Some(v1.to_vec()));
+        assert_eq!(mem_entries.get_value(k5.as_ref()), Some(v5.to_vec()));
     }
 
     fn generate_ents(begin_idx: u64, end_idx: u64) -> Vec<Entry> {

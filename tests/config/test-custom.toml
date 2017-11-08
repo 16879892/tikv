@@ -49,6 +49,7 @@ raft-max-size-per-msg = "12MB"
 raft-max-inflight-msgs = 123
 raft-entry-max-size = "12MB"
 raft-log-gc-tick-interval = "12s"
+raft-log-gc-expired-files-tick-interval = "33s"
 raft-log-gc-threshold = 12
 raft-log-gc-count-limit = 12
 raft-log-gc-size-limit = "1KB"

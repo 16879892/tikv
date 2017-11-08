@@ -457,6 +457,8 @@ mod tests {
     use storage::{CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
     use storage::mvcc::{Lock, LockType};
     use util::rocksdb::{self as rocksdb_util, CFOptions};
+    use raftengine::{LogBatch, MultiRaftEngine as RaftEngine, RecoveryMode,
+                     DEFAULT_BYTES_PER_SYNC, DEFAULT_LOG_MAX_SIZE};
     use super::*;
 
     #[test]
@@ -486,10 +488,11 @@ mod tests {
 
     fn new_debugger() -> Debugger {
         let tmp = TempDir::new("test_debug").unwrap();
-        let path = tmp.path().to_str().unwrap();
+        let path = tmp.path();
+        let raft_path = path.join("raft");
         let engine = Arc::new(
             rocksdb_util::new_engine_opt(
-                path,
+                path.to_str().unwrap(),
                 DBOptions::new(),
                 vec![
                     CFOptions::new(CF_DEFAULT, ColumnFamilyOptions::new()),
@@ -499,8 +502,14 @@ mod tests {
                 ],
             ).unwrap(),
         );
+        let raft_engine = Arc::new(RaftEngine::new(
+            raft_path.to_str().unwrap(),
+            RecoveryMode::TolerateCorruptedTailRecords,
+            DEFAULT_BYTES_PER_SYNC,
+            DEFAULT_LOG_MAX_SIZE,
+        ));
 
-        let engines = Engines::new(engine.clone(), engine);
+        let engines = Engines::new(engine, raft_engine);
         Debugger::new(engines)
     }
 
@@ -524,7 +533,7 @@ mod tests {
     #[test]
     fn test_raft_log() {
         let debugger = new_debugger();
-        let engine = &debugger.engines.raft_engine;
+        let raft_engine = &debugger.engines.raft_engine;
         let (region_id, log_index) = (1, 1);
         let key = keys::raft_log_key(region_id, log_index);
         let mut entry = Entry::new();
@@ -532,9 +541,14 @@ mod tests {
         entry.set_index(1);
         entry.set_entry_type(EntryType::EntryNormal);
         entry.set_data(vec![42]);
-        engine.put_msg(key.as_slice(), &entry).unwrap();
+        let mut log_batch = LogBatch::default();
+        log_batch.add_entries(region_id, vec![entry.clone()]);
+        raft_engine.write(log_batch, false).unwrap();
         assert_eq!(
-            engine.get_msg::<Entry>(key.as_slice()).unwrap().unwrap(),
+            raft_engine
+                .get_msg::<Entry>(region_id, key.as_slice())
+                .unwrap()
+                .unwrap(),
             entry
         );
 
@@ -556,10 +570,12 @@ mod tests {
         let raft_state_key = keys::raft_state_key(region_id);
         let mut raft_state = RaftLocalState::new();
         raft_state.set_last_index(42);
-        raft_engine.put_msg(&raft_state_key, &raft_state).unwrap();
+        raft_engine
+            .put_msg(region_id, &raft_state_key, &raft_state)
+            .unwrap();
         assert_eq!(
             raft_engine
-                .get_msg::<RaftLocalState>(&raft_state_key)
+                .get_msg::<RaftLocalState>(region_id, &raft_state_key)
                 .unwrap()
                 .unwrap(),
             raft_state

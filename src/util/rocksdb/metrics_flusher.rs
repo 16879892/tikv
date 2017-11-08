@@ -99,6 +99,8 @@ mod tests {
     use util::rocksdb::{self, CFOptions};
     use storage::{CF_DEFAULT, CF_LOCK, CF_WRITE};
     use std::thread::sleep;
+    use raftengine::{LogBatch, MultiRaftEngine as RaftEngine, RecoveryMode,
+                     DEFAULT_BYTES_PER_SYNC, DEFAULT_LOG_MAX_SIZE};
 
     #[test]
     fn test_metrics_flusher() {
@@ -116,10 +118,12 @@ mod tests {
         );
 
         let cfs_opts = vec![CFOptions::new(CF_DEFAULT, ColumnFamilyOptions::new())];
-        let raft_engine = Arc::new(
-            rocksdb::new_engine_opt(raft_path.to_str().unwrap(), DBOptions::new(), cfs_opts)
-                .unwrap(),
-        );
+        let raft_engine = Arc::new(RaftEngine::new(
+            raft_path.to_str().unwrap(),
+            RecoveryMode::TolerateCorruptedTailRecords,
+            DEFAULT_BYTES_PER_SYNC,
+            DEFAULT_LOG_MAX_SIZE,
+        ));
         let engines = Engines::new(engine, raft_engine);
         let mut metrics_flusher = MetricsFlusher::new(engines, Duration::from_millis(100));
 

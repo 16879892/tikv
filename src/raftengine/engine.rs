@@ -237,6 +237,23 @@ impl MultiRaftEngine {
         pipe_log.sync_data()
     }
 
+    pub fn kv_count(&self, region_id: u64) -> usize {
+        let mem_entries = self.mem_entries[region_id as usize % SLOTS_COUNT]
+            .read()
+            .unwrap();
+        if let Some(mem_entries) = mem_entries.get(&region_id) {
+            return mem_entries.kvs.len();
+        }
+        0
+    }
+
+    pub fn put_msg<M: protobuf::Message>(&self, region_id: u64, key: &[u8], m: &M) -> Result<()> {
+        let value = m.write_to_bytes()?;
+        let mut log_batch = LogBatch::default();
+        log_batch.put_value(region_id, key, &value);
+        self.write(log_batch, false)
+    }
+
     pub fn get_value(&self, region_id: u64, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let mem_entries = self.mem_entries[region_id as usize % SLOTS_COUNT]
             .read()
@@ -308,6 +325,13 @@ impl MultiRaftEngine {
             }
         }
         true
+    }
+
+    pub fn region_is_empty(&self, region_id: u64) -> bool {
+        let mem_entries = self.mem_entries[region_id as usize % SLOTS_COUNT]
+            .read()
+            .unwrap();
+        mem_entries.get(&region_id).is_none()
     }
 
     fn post_append_to_file(&self, log_batch: LogBatch, file_num: u64) {

@@ -466,7 +466,7 @@ mod tests {
 
     #[test]
     fn test_kv_enc_dec() {
-        let kv = KeyValue::new(8, b"key", b"value");
+        let kv = KeyValue::new(OpType::Put, 8, b"key", Some(b"value"));
         let mut encoded = vec![];
         kv.encode_to(&mut encoded).unwrap();
         let mut bytes_slice = encoded.as_slice();
@@ -480,7 +480,7 @@ mod tests {
         let items = vec![
             LogItem::from_entries(8, vec![Entry::new(); 10]),
             LogItem::from_command(Command::Clean { region_id: 8 }),
-            LogItem::from_kv(8, b"key", b"value"),
+            LogItem::from_kv(OpType::Put, 8, b"key", Some(b"value")),
         ];
 
         for item in items {
@@ -498,7 +498,7 @@ mod tests {
         let mut batch = LogBatch::default();
         batch.add_entries(8, vec![Entry::new(); 10]);
         batch.add_command(Command::Clean { region_id: 8 });
-        batch.add_kv(8, b"key", b"value");
+        batch.add_kv(OpType::Put, 8, b"key", Some(b"value"));
 
         let encoded = batch.to_vec().unwrap();
         let mut s = encoded.as_slice();

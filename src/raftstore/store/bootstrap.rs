@@ -139,6 +139,8 @@ mod tests {
     use raftstore::store::engine::Peekable;
     use raftstore::store::{keys, Engines};
     use storage::CF_DEFAULT;
+    use raftengine::{LogBatch, MultiRaftEngine as RaftEngine, RecoveryMode,
+                     DEFAULT_BYTES_PER_SYNC, DEFAULT_LOG_MAX_SIZE};
 
     #[test]
     fn test_bootstrap() {
@@ -147,9 +149,12 @@ mod tests {
         let kv_engine = Arc::new(
             rocksdb::new_engine(path.path().to_str().unwrap(), &[CF_DEFAULT, CF_RAFT]).unwrap(),
         );
-        let raft_engine = Arc::new(
-            rocksdb::new_engine(raft_path.to_str().unwrap(), &[CF_DEFAULT]).unwrap(),
-        );
+        let raft_engine = Arc::new(RaftEngine::new(
+            raft_path.to_str().unwrap(),
+            RecoveryMode::TolerateCorruptedTailRecords,
+            DEFAULT_BYTES_PER_SYNC,
+            DEFAULT_LOG_MAX_SIZE,
+        ));
         let engines = Engines::new(kv_engine.clone(), raft_engine.clone());
 
         assert!(bootstrap_store(&engines, 1, 1).is_ok());
@@ -176,7 +181,7 @@ mod tests {
         );
         assert!(
             raft_engine
-                .get_value(&keys::raft_state_key(1))
+                .get_value(1, &keys::raft_state_key(1))
                 .unwrap()
                 .is_some()
         );
@@ -191,13 +196,6 @@ mod tests {
                 &keys::region_meta_prefix(2)
             ).unwrap()
         );
-        assert!(
-            is_range_empty(
-                &raft_engine,
-                CF_DEFAULT,
-                &keys::region_raft_prefix(1),
-                &keys::region_raft_prefix(2)
-            ).unwrap()
-        );
+        assert!(raft_engine.region_is_empty(1));
     }
 }

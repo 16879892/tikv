@@ -307,39 +307,45 @@ mod tests {
     use raftstore::Result;
     use raftstore::store::engine::*;
     use raftstore::store::keys::*;
-    use raftstore::store::{CacheQueryStats, PeerStorage};
+    use raftstore::store::PeerStorage;
     use storage::{CFStatistics, Cursor, Key, ScanMode, ALL_CFS, CF_DEFAULT};
     use util::{escape, rocksdb, worker};
+    use raftengine::{LogBatch, MultiRaftEngine as RaftEngine, RecoveryMode,
+                     DEFAULT_BYTES_PER_SYNC, DEFAULT_LOG_MAX_SIZE};
 
     use super::*;
 
     type DataSet = Vec<(Vec<u8>, Vec<u8>)>;
 
-    fn new_temp_engine(path: &TempDir) -> (Arc<DB>, Arc<DB>) {
+    fn new_temp_engine(path: &TempDir) -> (Arc<DB>, Arc<RaftEngine>) {
         let raft_path = path.path().join(Path::new("raft"));
         (
             Arc::new(
                 rocksdb::new_engine(path.path().to_str().unwrap(), ALL_CFS).unwrap(),
             ),
-            Arc::new(
-                rocksdb::new_engine(raft_path.to_str().unwrap(), &[CF_DEFAULT]).unwrap(),
-            ),
+            Arc::new(RaftEngine::new(
+                raft_path.to_str().unwrap(),
+                RecoveryMode::TolerateCorruptedTailRecords,
+                DEFAULT_BYTES_PER_SYNC,
+                DEFAULT_LOG_MAX_SIZE,
+            )),
         )
     }
 
-    fn new_peer_storage(engine: Arc<DB>, raft_engine: Arc<DB>, r: &Region) -> PeerStorage {
-        let metrics = Rc::new(RefCell::new(CacheQueryStats::default()));
+    fn new_peer_storage(engine: Arc<DB>, raft_engine: Arc<RaftEngine>, r: &Region) -> PeerStorage {
         PeerStorage::new(
             engine,
             raft_engine,
             r,
             worker::dummy_scheduler(),
             "".to_owned(),
-            metrics,
         ).unwrap()
     }
 
-    fn load_default_dataset(engine: Arc<DB>, raft_engine: Arc<DB>) -> (PeerStorage, DataSet) {
+    fn load_default_dataset(
+        engine: Arc<DB>,
+        raft_engine: Arc<RaftEngine>,
+    ) -> (PeerStorage, DataSet) {
         let mut r = Region::new();
         r.mut_peers().push(Peer::new());
         r.set_id(10);

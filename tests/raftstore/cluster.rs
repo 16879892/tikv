@@ -25,7 +25,7 @@ use futures::Future;
 use tikv::raftstore::{Error, Result};
 use tikv::raftstore::store::*;
 use tikv::config::TiKvConfig;
-use tikv::storage::{ALL_CFS, CF_DEFAULT};
+use tikv::storage::ALL_CFS;
 use tikv::raftengine::{MultiRaftEngine as RaftEngine, RecoveryMode, DEFAULT_BYTES_PER_SYNC,
                        DEFAULT_LOG_MAX_SIZE};
 use super::util::*;
