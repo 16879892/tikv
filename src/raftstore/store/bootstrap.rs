@@ -62,7 +62,7 @@ pub fn bootstrap_store(engines: &Engines, cluster_id: u64, store_id: u64) -> Res
 }
 
 // Write first region meta and prepare state.
-pub fn write_prepare_bootstrap(engines: &mut Engines, region: &metapb::Region) -> Result<()> {
+pub fn write_prepare_bootstrap(engines: &Engines, region: &metapb::Region) -> Result<()> {
     let mut state = RegionLocalState::new();
     state.set_region(region.clone());
 
@@ -81,7 +81,7 @@ pub fn write_prepare_bootstrap(engines: &mut Engines, region: &metapb::Region) -
 }
 
 // Clear first region meta and prepare state.
-pub fn clear_prepare_bootstrap(engines: &mut Engines, region_id: u64) -> Result<()> {
+pub fn clear_prepare_bootstrap(engines: &Engines, region_id: u64) -> Result<()> {
     let mut raft_wb = LogBatch::default();
     raft_wb.delete(region_id, &keys::raft_state_key(region_id));
     engines.raft_engine.write(raft_wb, true)?;
@@ -106,7 +106,7 @@ pub fn clear_prepare_bootstrap_state(engines: &Engines) -> Result<()> {
 
 // Prepare bootstrap.
 pub fn prepare_bootstrap(
-    engines: &mut Engines,
+    engines: &Engines,
     store_id: u64,
     region_id: u64,
     peer_id: u64,

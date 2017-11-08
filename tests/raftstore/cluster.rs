@@ -187,7 +187,7 @@ impl<T: Simulator> Cluster<T> {
         self.engines[&node_id].kv_engine.clone()
     }
 
-    pub fn get_raft_engine(&self, node_id: u64) -> Arc<DB> {
+    pub fn get_raft_engine(&self, node_id: u64) -> Arc<RaftEngine> {
         self.engines[&node_id].raft_engine.clone()
     }
 
@@ -660,7 +660,9 @@ impl<T: Simulator> Cluster<T> {
     pub fn must_flush(&mut self, sync: bool) {
         for engines in &self.dbs {
             engines.kv_engine.flush(sync).unwrap();
-            engines.raft_engine.flush(sync).unwrap();
+            if sync {
+                engines.raft_engine.sync_data().unwrap();
+            }
         }
     }
 
