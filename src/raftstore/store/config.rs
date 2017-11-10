@@ -119,7 +119,7 @@ impl Default for Config {
             raft_entry_max_size: ReadableSize::mb(8),
             raft_log_gc_tick_interval: ReadableDuration::secs(10),
             raft_log_gc_expired_files_tick_interval: ReadableDuration::secs(60),
-            raft_log_gc_threshold: 50,
+            raft_log_gc_threshold: 20,
             // Assume the average size of entries is 1k.
             raft_log_gc_count_limit: split_size * 3 / 4 / ReadableSize::kb(1),
             raft_log_gc_size_limit: split_size * 3 / 4,
