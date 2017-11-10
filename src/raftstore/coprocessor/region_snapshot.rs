@@ -312,7 +312,7 @@ mod tests {
     use storage::{CFStatistics, Cursor, Key, ScanMode, ALL_CFS, CF_DEFAULT};
     use util::{escape, rocksdb, worker};
     use raftengine::{LogBatch, MultiRaftEngine as RaftEngine, RecoveryMode,
-                     DEFAULT_BYTES_PER_SYNC, DEFAULT_LOG_MAX_SIZE};
+                     DEFAULT_BYTES_PER_SYNC, DEFAULT_HIGH_WATER_SIZE, DEFAULT_LOG_ROTATE_SIZE};
 
     use super::*;
 
@@ -330,7 +330,8 @@ mod tests {
                 raft_path.to_str().unwrap(),
                 RecoveryMode::TolerateCorruptedTailRecords,
                 DEFAULT_BYTES_PER_SYNC,
-                DEFAULT_LOG_MAX_SIZE,
+                DEFAULT_LOG_ROTATE_SIZE,
+                DEFAULT_HIGH_WATER_SIZE,
             )),
         )
     }

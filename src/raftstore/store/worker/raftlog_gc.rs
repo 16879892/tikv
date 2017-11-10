@@ -12,12 +12,14 @@
 // limitations under the License.
 
 use util::worker::Runnable;
+use util::collections::HashSet;
 use raftengine::{MultiRaftEngine as RaftEngine, Result as RaftEngineResult};
 
 use std::sync::Arc;
 use std::fmt::{self, Display, Formatter};
 use std::error;
 use std::sync::mpsc::Sender;
+
 
 pub enum Task {
     RegionTask(RegionTask),
@@ -46,6 +48,10 @@ impl Task {
     }
 }
 
+pub struct TaskRes {
+    pub regions_need_compact: HashSet<u64>,
+}
+
 pub struct RegionTask {
     pub raft_engine: Arc<RaftEngine>,
     pub region_id: u64,
@@ -55,10 +61,6 @@ pub struct RegionTask {
 
 pub struct EngineTask {
     pub raft_engine: Arc<RaftEngine>,
-}
-
-pub struct RegionTaskRes {
-    pub collected: u64,
 }
 
 impl Display for Task {
@@ -89,11 +91,11 @@ quick_error! {
 }
 
 pub struct Runner {
-    ch: Option<Sender<RegionTaskRes>>,
+    ch: Option<Sender<TaskRes>>,
 }
 
 impl Runner {
-    pub fn new(ch: Option<Sender<RegionTaskRes>>) -> Runner {
+    pub fn new(ch: Option<Sender<TaskRes>>) -> Runner {
         Runner { ch: ch }
     }
 
@@ -112,20 +114,20 @@ impl Runner {
         if raft_engine.rewrite_inactive() {
             raft_engine.sync_data()?;
         }
-        raft_engine.purge_expired_files()
-    }
 
-    fn report_collected(&self, collected: u64) {
-        if self.ch.is_none() {
-            return;
+        // Collect regions which have entries exist for a long time.
+        if self.ch.is_some() {
+            let regions = raft_engine.regions_need_compact();
+            self.ch
+                .as_ref()
+                .unwrap()
+                .send(TaskRes {
+                    regions_need_compact: regions,
+                })
+                .unwrap();
         }
-        self.ch
-            .as_ref()
-            .unwrap()
-            .send(RegionTaskRes {
-                collected: collected,
-            })
-            .unwrap();
+
+        raft_engine.purge_expired_files()
     }
 }
 
@@ -140,7 +142,6 @@ impl Runnable<Task> for Runner {
                     task.end_idx,
                 );
                 debug!("[region {}] collected {} log entries", task.region_id, n);
-                self.report_collected(n);
             }
             Task::EngineTask(task) => if let Err(e) = self.gc_expired_files(task.raft_engine) {
                 error!("GC expired files for raft engine error : {:?}", e);
@@ -160,7 +161,7 @@ mod test {
 
     use storage::CF_DEFAULT;
     use raftengine::{LogBatch, MultiRaftEngine as RaftEngine, RecoveryMode,
-                     DEFAULT_BYTES_PER_SYNC, DEFAULT_LOG_MAX_SIZE};
+                     DEFAULT_BYTES_PER_SYNC, DEFAULT_HIGH_WATER_SIZE, DEFAULT_LOG_ROTATE_SIZE};
     use super::*;
 
     #[test]
@@ -170,12 +171,12 @@ mod test {
             path.path().to_str().unwrap(),
             RecoveryMode::TolerateCorruptedTailRecords,
             DEFAULT_BYTES_PER_SYNC,
-            DEFAULT_LOG_MAX_SIZE,
+            DEFAULT_LOG_ROTATE_SIZE,
+            DEFAULT_HIGH_WATER_SIZE,
         );
         let raft_engine = Arc::new(raft_engine);
 
-        let (tx, rx) = mpsc::channel();
-        let mut runner = Runner::new(Some(tx));
+        let mut runner = Runner::new(None);
 
         // generate raft logs
         let region_id = 1;
@@ -192,34 +193,28 @@ mod test {
         let tbls = vec![
             (
                 Task::region_task(raft_engine.clone(), region_id, 0, 10),
-                10,
                 (0, 10),
                 (10, 100),
             ),
             (
                 Task::region_task(raft_engine.clone(), region_id, 0, 50),
-                40,
                 (0, 50),
                 (50, 100),
             ),
             (
                 Task::region_task(raft_engine.clone(), region_id, 50, 50),
-                0,
                 (0, 50),
                 (50, 100),
             ),
             (
                 Task::region_task(raft_engine.clone(), region_id, 50, 60),
-                10,
                 (0, 60),
                 (60, 100),
             ),
         ];
 
-        for (task, expected_collectd, not_exist_range, exist_range) in tbls {
+        for (task, not_exist_range, exist_range) in tbls {
             runner.run(task);
-            let res = rx.recv_timeout(Duration::from_secs(3)).unwrap();
-            assert_eq!(res.collected, expected_collectd);
             raft_log_must_not_exist(&raft_engine, 1, not_exist_range.0, not_exist_range.1);
             raft_log_must_exist(&raft_engine, 1, exist_range.0, exist_range.1);
         }
@@ -231,18 +226,15 @@ mod test {
         start_idx: u64,
         end_idx: u64,
     ) {
-        let mut vec = vec![];
-        assert!(
-            raft_engine
-                .fetch_entries_to(region_id, start_idx, end_idx, &mut vec)
-                .is_err()
-        );
+        for idx in start_idx..end_idx {
+            assert!(raft_engine.get_entry(region_id, idx).unwrap().is_none());
+        }
     }
 
     fn raft_log_must_exist(raft_engine: &RaftEngine, region_id: u64, start_idx: u64, end_idx: u64) {
         let mut vec = vec![];
         raft_engine
-            .fetch_entries_to(region_id, start_idx, end_idx, &mut vec)
+            .fetch_entries_to(region_id, start_idx, end_idx, None, &mut vec)
             .unwrap();
         assert_eq!(vec.len(), (end_idx - start_idx) as usize);
 

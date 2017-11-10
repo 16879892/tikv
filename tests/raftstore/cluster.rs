@@ -27,7 +27,7 @@ use tikv::raftstore::store::*;
 use tikv::config::TiKvConfig;
 use tikv::storage::ALL_CFS;
 use tikv::raftengine::{MultiRaftEngine as RaftEngine, RecoveryMode, DEFAULT_BYTES_PER_SYNC,
-                       DEFAULT_LOG_MAX_SIZE};
+                       DEFAULT_HIGH_WATER_SIZE, DEFAULT_LOG_ROTATE_SIZE};
 use super::util::*;
 use kvproto::pdpb;
 use kvproto::raft_cmdpb::*;
@@ -132,7 +132,8 @@ impl<T: Simulator> Cluster<T> {
                 raft_path.to_str().unwrap(),
                 RecoveryMode::TolerateCorruptedTailRecords,
                 DEFAULT_BYTES_PER_SYNC,
-                DEFAULT_LOG_MAX_SIZE,
+                DEFAULT_LOG_ROTATE_SIZE,
+                DEFAULT_HIGH_WATER_SIZE,
             ));
             self.dbs.push(Engines::new(engine, raft_engine));
         }

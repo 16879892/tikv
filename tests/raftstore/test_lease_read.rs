@@ -25,7 +25,6 @@ use kvproto::raft_cmdpb::CmdType;
 use kvproto::raft_serverpb::{RaftLocalState, RaftMessage};
 use tikv::raftstore::{Error, Result};
 use tikv::raftstore::store::keys;
-use tikv::raftstore::store::engine::Peekable;
 use tikv::util::{escape, HandyRwLock};
 use tikv::util::config::*;
 

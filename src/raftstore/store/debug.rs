@@ -458,7 +458,7 @@ mod tests {
     use storage::mvcc::{Lock, LockType};
     use util::rocksdb::{self as rocksdb_util, CFOptions};
     use raftengine::{LogBatch, MultiRaftEngine as RaftEngine, RecoveryMode,
-                     DEFAULT_BYTES_PER_SYNC, DEFAULT_LOG_MAX_SIZE};
+                     DEFAULT_BYTES_PER_SYNC, DEFAULT_HIGH_WATER_SIZE, DEFAULT_LOG_ROTATE_SIZE};
     use super::*;
 
     #[test]
@@ -505,7 +505,8 @@ mod tests {
             raft_path.to_str().unwrap(),
             RecoveryMode::TolerateCorruptedTailRecords,
             DEFAULT_BYTES_PER_SYNC,
-            DEFAULT_LOG_MAX_SIZE,
+            DEFAULT_LOG_ROTATE_SIZE,
+            DEFAULT_HIGH_WATER_SIZE,
         ));
 
         let engines = Engines::new(engine, raft_engine);
@@ -543,7 +544,10 @@ mod tests {
         log_batch.add_entries(region_id, vec![entry.clone()]);
         raft_engine.write(log_batch, false).unwrap();
         assert_eq!(
-            raft_engine.get_entry(region_id, log_index).unwrap().unwrap(),
+            raft_engine
+                .get_entry(region_id, log_index)
+                .unwrap()
+                .unwrap(),
             entry
         );
 

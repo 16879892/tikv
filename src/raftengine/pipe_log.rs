@@ -18,7 +18,7 @@ const INIT_FILE_NUM: u64 = 1;
 const KB: usize = 1024;
 const MB: usize = KB * KB;
 pub const DEFAULT_BYTES_PER_SYNC: usize = 32 * KB;
-pub const DEFAULT_LOG_MAX_SIZE: usize = 128 * MB;
+pub const DEFAULT_LOG_ROTATE_SIZE: usize = 128 * MB;
 
 pub struct PipeLog {
     first_file_num: u64,
@@ -135,7 +135,7 @@ impl PipeLog {
         Ok(file_num)
     }
 
-    pub fn append_log_batch(&mut self, batch: &LogBatch, sync: bool) -> Result<u64> {
+    pub fn append_log_batch(&mut self, batch: &mut LogBatch, sync: bool) -> Result<u64> {
         match batch.to_vec() {
             Some(content) => self.append(&content, sync),
             None => Ok(0),
@@ -276,6 +276,21 @@ impl PipeLog {
 
     pub fn first_file_num(&self) -> u64 {
         self.first_file_num
+    }
+
+    pub fn total_size(&self) -> usize {
+        (self.active_file_num - self.first_file_num) as usize * self.rotate_size +
+            self.active_log_size
+    }
+
+    pub fn files_should_evict(&self, size_limit: usize) -> u64 {
+        let cur_size = self.total_size();
+        if cur_size > size_limit {
+            let count = (cur_size - size_limit) / self.rotate_size;
+            self.first_file_num + count as u64
+        } else {
+            self.first_file_num
+        }
     }
 }
 

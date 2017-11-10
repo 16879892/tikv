@@ -31,6 +31,7 @@ impl FileIndex {
 pub struct MemEntries {
     pub region_id: u64,
     pub entry_queue: VecDeque<Entry>,
+    pub entry_size: VecDeque<usize>,
     pub file_index: VecDeque<FileIndex>,
 
     // Region scope key/value pairs
@@ -43,14 +44,22 @@ impl MemEntries {
         MemEntries {
             region_id: region_id,
             entry_queue: VecDeque::with_capacity(SHRINK_CACHE_CAPACITY),
+            entry_size: VecDeque::with_capacity(SHRINK_CACHE_CAPACITY),
             file_index: VecDeque::new(),
             kvs: HashMap::default(),
         }
     }
 
-    pub fn append(&mut self, entries: Vec<Entry>, file_num: u64) {
+    pub fn append(&mut self, entries: Vec<Entry>, entries_size: Vec<usize>, file_num: u64) {
         if entries.is_empty() {
             return;
+        }
+        if entries.len() != entries_size.len() {
+            panic!(
+                "entries len {} not equal to entries_size len {}",
+                entries.len(),
+                entries_size.len()
+            );
         }
         if let Some(cache_last_index) = self.entry_queue.back().map(|e| e.get_index()) {
             let first_index = entries[0].get_index();
@@ -59,11 +68,13 @@ impl MemEntries {
             if cache_last_index >= first_index {
                 if self.entry_queue.front().unwrap().get_index() >= first_index {
                     self.entry_queue.clear();
+                    self.entry_size.clear();
                     self.file_index.clear();
                 } else {
                     let left =
                         self.entry_queue.len() - (cache_last_index - first_index + 1) as usize;
                     self.entry_queue.truncate(left);
+                    self.entry_size.truncate(left);
 
                     let cache_last_index = self.entry_queue.back().unwrap().get_index();
                     self.truncate_file_index(cache_last_index);
@@ -80,6 +91,7 @@ impl MemEntries {
 
         // Append entries.
         self.entry_queue.extend(entries);
+        self.entry_size.extend(entries_size);
 
         // Update file index.
         let cache_last_index = self.entry_queue.back().unwrap().get_index();
@@ -115,11 +127,13 @@ impl MemEntries {
         let cache_last_idx = self.entry_queue.back().unwrap().get_index();
         let compact_count = cmp::min(cache_last_idx, idx) - cache_first_idx;
         self.entry_queue.drain(..compact_count as usize);
+        self.entry_size.drain(..compact_count as usize);
 
         if self.entry_queue.len() < SHRINK_CACHE_CAPACITY &&
             self.entry_queue.capacity() > SHRINK_CACHE_CAPACITY
         {
             self.entry_queue.shrink_to_fit();
+            self.entry_size.shrink_to_fit();
         }
 
         let first_index = match self.entry_queue.front() {
@@ -153,7 +167,13 @@ impl MemEntries {
         Some(self.entry_queue[(index - first_index) as usize].clone())
     }
 
-    pub fn fetch_entries_to(&self, begin: u64, end: u64, vec: &mut Vec<Entry>) -> Result<u64> {
+    pub fn fetch_entries_to(
+        &self,
+        begin: u64,
+        end: u64,
+        max_size: Option<usize>,
+        vec: &mut Vec<Entry>,
+    ) -> Result<u64> {
         if end <= begin {
             return Err(box_err!(
                 "Range error when fetch entries for region {}.",
@@ -167,31 +187,63 @@ impl MemEntries {
 
         let first_index = self.entry_queue.front().unwrap().get_index();
         let last_index = self.entry_queue.back().unwrap().get_index();
-        if begin < first_index {
+        if begin < first_index || end > last_index + 1 {
             return Err(box_err!(
-                "First entry's index is larger than wanted index. \
-                 first index {}, wanted first index {}, region {}",
+                "Wanted entries [{}, {}) out of range [{}, {})",
+                begin,
+                end,
                 first_index,
-                begin,
-                self.region_id
-            ));
-        }
-        if begin > last_index {
-            return Err(box_err!(
-                "Wanted first index is larger than last index. \
-                 last index {}, wanted first index {}, region {}",
-                last_index,
-                begin,
-                self.region_id
+                last_index + 1
             ));
         }
 
         let start_idx = (begin - first_index) as usize;
         let end_idx = cmp::min((end - begin) as usize + start_idx, self.entry_queue.len());
         let (first, second) = util::slices_in_range(&self.entry_queue, start_idx, end_idx);
-        vec.extend_from_slice(first);
-        vec.extend_from_slice(second);
-        Ok(first.len() as u64 + second.len() as u64)
+        match max_size {
+            Some(max_size) => {
+                let max_count = self.max_count(start_idx, end_idx, max_size);
+                if first.len() >= max_count {
+                    vec.extend_from_slice(&first[..max_count]);
+                } else {
+                    vec.extend_from_slice(first);
+                    let left = max_count - first.len();
+                    vec.extend_from_slice(&second[..left]);
+                }
+
+                Ok(max_count as u64)
+            }
+            None => {
+                vec.extend_from_slice(first);
+                vec.extend_from_slice(second);
+                Ok(first.len() as u64 + second.len() as u64)
+            }
+        }
+    }
+
+    fn max_count(&self, start_idx: usize, end_idx: usize, max_size: usize) -> usize {
+        assert!(start_idx < end_idx);
+        let (first, second) = util::slices_in_range(&self.entry_size, start_idx, end_idx);
+
+        let mut count = 0;
+        let mut total_size = 0;
+        for size in first {
+            count += 1;
+            total_size += *size;
+            if total_size > max_size {
+                // No matter max_size's value, fetch one entry at lease.
+                return if count > 1 { count - 1 } else { count };
+            }
+
+        }
+        for size in second {
+            count += 1;
+            total_size += *size;
+            if total_size > max_size {
+                return if count > 1 { count - 1 } else { count };
+            }
+        }
+        count
     }
 
     pub fn fetch_all(&self, vec: &mut Vec<Entry>) {
@@ -226,6 +278,18 @@ impl MemEntries {
             (None, Some(kvs_max)) => Some(kvs_max),
             (None, None) => None,
         }
+    }
+
+    pub fn total_count(&self) -> usize {
+        self.entry_queue.len()
+    }
+
+    pub fn total_size(&self) -> usize {
+        self.entry_size.iter().fold(0, |sum, val| sum + val)
+    }
+
+    pub fn region_id(&self) -> u64 {
+        self.region_id
     }
 
     fn kvs_min_file_num(&self) -> Option<u64> {
@@ -283,9 +347,9 @@ mod tests {
         // append entries [0, 10) file_num = 1
         // append entries [10, 20) file_num = 1
         // append entries [20, 30) file_num = 2
-        mem_entries.append(generate_ents(0, 10), 1);
-        mem_entries.append(generate_ents(10, 20), 1);
-        mem_entries.append(generate_ents(20, 30), 2);
+        mem_entries.append(generate_ents(0, 10), vec![1; 10], 1);
+        mem_entries.append(generate_ents(10, 20), vec![1; 10], 1);
+        mem_entries.append(generate_ents(20, 30), vec![1; 10], 2);
         assert_eq!(
             mem_entries.file_index,
             VecDeque::from(vec![FileIndex::new(1, 19), FileIndex::new(2, 29)])
@@ -330,7 +394,7 @@ mod tests {
         assert_eq!(mem_entries.max_file_num().unwrap(), 2);
 
         // append entries [28, 38) file_num = 3
-        mem_entries.append(generate_ents(28, 38), 3);
+        mem_entries.append(generate_ents(28, 38), vec![1; 10], 3);
         assert_eq!(
             mem_entries.file_index,
             VecDeque::from(vec![FileIndex::new(2, 27), FileIndex::new(3, 37)])
@@ -349,19 +413,61 @@ mod tests {
         assert_eq!(ents[12].get_index(), 37);
 
         ents.clear();
-        assert!(mem_entries.fetch_entries_to(24, 37, &mut ents).is_err());
-        assert!(mem_entries.fetch_entries_to(40, 45, &mut ents).is_err());
-        assert_eq!(mem_entries.fetch_entries_to(25, 38, &mut ents).unwrap(), 13);
+        // out of range
+        assert!(
+            mem_entries
+                .fetch_entries_to(24, 37, None, &mut ents)
+                .is_err()
+        );
+        // out of range
+        assert!(
+            mem_entries
+                .fetch_entries_to(35, 45, None, &mut ents)
+                .is_err()
+        );
+        // no max size limitation
+        assert_eq!(
+            mem_entries
+                .fetch_entries_to(25, 38, None, &mut ents)
+                .unwrap(),
+            13
+        );
         assert_eq!(ents[0].get_index(), 25);
         assert_eq!(ents[12].get_index(), 37);
 
+        // max size limit to 5
         ents.clear();
-        assert_eq!(mem_entries.fetch_entries_to(30, 40, &mut ents).unwrap(), 8);
+        assert_eq!(
+            mem_entries
+                .fetch_entries_to(25, 38, Some(5), &mut ents)
+                .unwrap(),
+            5
+        );
+        assert_eq!(ents[0].get_index(), 25);
+        assert_eq!(ents[4].get_index(), 29);
+
+        // even max size limit is 0, the first entry should be return
+        ents.clear();
+        assert_eq!(
+            mem_entries
+                .fetch_entries_to(25, 38, Some(0), &mut ents)
+                .unwrap(),
+            1
+        );
+        assert_eq!(ents[0].get_index(), 25);
+
+        ents.clear();
+        assert_eq!(
+            mem_entries
+                .fetch_entries_to(30, 38, None, &mut ents)
+                .unwrap(),
+            8
+        );
         assert_eq!(ents[0].get_index(), 30);
         assert_eq!(ents[7].get_index(), 37);
 
         // append entries [20, 40) file_num = 3
-        mem_entries.append(generate_ents(20, 40), 3);
+        mem_entries.append(generate_ents(20, 40), vec![1; 20], 3);
         assert_eq!(
             mem_entries.file_index,
             VecDeque::from(vec![FileIndex::new(3, 39)])

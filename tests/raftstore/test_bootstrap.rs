@@ -25,7 +25,7 @@ use kvproto::metapb;
 use kvproto::raft_serverpb::RegionLocalState;
 
 use tikv::raftengine::{MultiRaftEngine as RaftEngine, RecoveryMode, DEFAULT_BYTES_PER_SYNC,
-                       DEFAULT_LOG_MAX_SIZE};
+                       DEFAULT_HIGH_WATER_SIZE, DEFAULT_LOG_ROTATE_SIZE};
 
 use super::pd::{bootstrap_with_first_region, TestPdClient};
 use super::cluster::{Cluster, Simulator};
@@ -64,7 +64,8 @@ fn test_node_bootstrap_with_prepared_data() {
         tmp_path_raft.to_str().unwrap(),
         RecoveryMode::TolerateCorruptedTailRecords,
         DEFAULT_BYTES_PER_SYNC,
-        DEFAULT_LOG_MAX_SIZE,
+        DEFAULT_LOG_ROTATE_SIZE,
+        DEFAULT_HIGH_WATER_SIZE,
     ));
     let engines = Engines::new(engine.clone(), raft_engine.clone());
     let tmp_mgr = TempDir::new("test_cluster").unwrap();

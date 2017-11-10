@@ -7,13 +7,15 @@ use std::sync::RwLock;
 use protobuf;
 use kvproto::eraftpb::Entry;
 
-use util::collections::HashMap;
+use util::collections::{HashMap, HashSet};
 
 use super::Result;
 use super::Error;
 use super::mem_entries::MemEntries;
 use super::pipe_log::{PipeLog, FILE_MAGIC_HEADER, VERSION};
 use super::log_batch::{Command, LogBatch, LogItemType, OpType};
+
+pub const DEFAULT_HIGH_WATER_SIZE: usize = 1024 * 1024 * 1024; // 1GB
 
 const SLOTS_COUNT: usize = 32;
 
@@ -33,6 +35,9 @@ pub struct MultiRaftEngine {
 
     // Persistent entries.
     pub pipe_log: RwLock<PipeLog>,
+
+    // Todo: use unified configuration
+    high_water_size: usize,
 }
 
 impl MultiRaftEngine {
@@ -41,6 +46,7 @@ impl MultiRaftEngine {
         recovery_mode: RecoveryMode,
         bytes_per_sync: usize,
         log_rotate_size: usize,
+        high_water_size: usize,
     ) -> MultiRaftEngine {
         let pip_log = PipeLog::open(dir, bytes_per_sync, log_rotate_size)
             .unwrap_or_else(|e| panic!("Open raft log failed, error: {:?}", e));
@@ -52,6 +58,7 @@ impl MultiRaftEngine {
             dir: String::from(dir),
             mem_entries: mem_entries,
             pipe_log: RwLock::new(pip_log),
+            high_water_size: high_water_size,
         };
         engine
             .recover(recovery_mode)
@@ -149,10 +156,17 @@ impl MultiRaftEngine {
 
     // Rewrite inactive region's entries and key/value pairs, so the old log can be dropped.
     pub fn rewrite_inactive(&self) -> bool {
-        let active_file_num = {
+        let (first_file_num, inactive_file_num) = {
             let pipe_log = self.pipe_log.read().unwrap();
-            pipe_log.active_file_num()
+            (
+                pipe_log.first_file_num(),
+                pipe_log.files_should_evict(self.high_water_size),
+            )
         };
+
+        if inactive_file_num == first_file_num {
+            return false;
+        }
 
         let mut has_write = false;
         for slot in 0..SLOTS_COUNT {
@@ -162,33 +176,74 @@ impl MultiRaftEngine {
                     Some(file_num) => file_num,
                     None => continue,
                 };
-                let count = entries.entry_queue.len();
-                if count > 0 && count <= 50 && max_file_num + 8 < active_file_num {
-                    // Rewrite entries
+
+                // Only rewrite regions which has no new entry for a long time,
+                // at the same time the cost of rewriting is trivial.
+                if max_file_num > inactive_file_num {
+                    continue;
+                }
+
+                let count = entries.total_count();
+                if count > 0 && count < 100 && entries.total_size() < 128 * 1024 {
                     has_write = true;
+
+                    // dump all entries
                     let mut ents = Vec::with_capacity(count);
                     entries.fetch_all(&mut ents);
                     let mut log_batch = LogBatch::default();
                     log_batch.add_entries(entries.region_id, ents.clone());
 
+                    // dump all key value pairs
                     let mut kvs = vec![];
                     entries.fetch_all_kvs(&mut kvs);
                     for kv in &kvs {
                         log_batch.put_value(entries.region_id, &kv.0, &kv.1);
                     }
-                    {
-                        let mut pipe_log = self.pipe_log.write().unwrap();
-                        match pipe_log.append_log_batch(&log_batch, false) {
-                            Ok(file_num) => self.post_append_to_file(log_batch, file_num),
-                            Err(e) => {
-                                panic!("Rewrite inactive region entries failed. error {:?}", e)
-                            }
-                        }
+
+                    // rewrite to new log file
+                    let mut pipe_log = self.pipe_log.write().unwrap();
+                    match pipe_log.append_log_batch(&mut log_batch, false) {
+                        Ok(file_num) => self.post_append_to_file(log_batch, file_num),
+                        Err(e) => panic!("Rewrite inactive region entries failed. error {:?}", e),
                     }
                 }
             }
         }
         has_write
+    }
+
+    pub fn regions_need_compact(&self) -> HashSet<u64> {
+        let (first_file_num, inactive_file_num) = {
+            let pipe_log = self.pipe_log.read().unwrap();
+            (
+                pipe_log.first_file_num(),
+                pipe_log.files_should_evict(self.high_water_size),
+            )
+        };
+
+        let mut regions = HashSet::default();
+        if first_file_num == inactive_file_num {
+            return regions;
+        }
+
+        for slot in 0..SLOTS_COUNT {
+            let mem_entries = self.mem_entries[slot].read().unwrap();
+            for entries in mem_entries.values() {
+                let min_file_num = match entries.min_file_num() {
+                    Some(file_num) => file_num,
+                    None => continue,
+                };
+
+                // Skip regions that has no entries in inactive files.
+                if min_file_num >= inactive_file_num {
+                    continue;
+                }
+
+                regions.insert(entries.region_id());
+            }
+        }
+
+        regions
     }
 
     pub fn purge_expired_files(&self) -> Result<()> {
@@ -218,10 +273,10 @@ impl MultiRaftEngine {
         }
     }
 
-    pub fn write(&self, log_batch: LogBatch, sync: bool) -> Result<()> {
+    pub fn write(&self, mut log_batch: LogBatch, sync: bool) -> Result<()> {
         let write_res = {
             let mut pipe_log = self.pipe_log.write().unwrap();
-            pipe_log.append_log_batch(&log_batch, sync)
+            pipe_log.append_log_batch(&mut log_batch, sync)
         };
         match write_res {
             Ok(file_num) => {
@@ -296,13 +351,14 @@ impl MultiRaftEngine {
         region_id: u64,
         begin: u64,
         end: u64,
+        max_size: Option<usize>,
         vec: &mut Vec<Entry>,
     ) -> Result<u64> {
         let mem_entries = self.mem_entries[region_id as usize % SLOTS_COUNT]
             .read()
             .unwrap();
         if let Some(mem_entries) = mem_entries.get(&region_id) {
-            mem_entries.fetch_entries_to(begin, end, vec)
+            mem_entries.fetch_entries_to(begin, end, max_size, vec)
         } else {
             Ok(0)
         }
@@ -324,6 +380,7 @@ impl MultiRaftEngine {
         true
     }
 
+    // only used in test
     pub fn region_not_exist(&self, region_id: u64) -> bool {
         let mem_entries = self.mem_entries[region_id as usize % SLOTS_COUNT]
             .read()
@@ -350,7 +407,11 @@ impl MultiRaftEngine {
                     let mem_queue = mem_entries
                         .entry(region_id)
                         .or_insert_with(|| MemEntries::new(region_id));
-                    mem_queue.append(entries_to_add.entries, file_num);
+                    mem_queue.append(
+                        entries_to_add.entries,
+                        entries_to_add.entries_size,
+                        file_num,
+                    );
                 }
                 LogItemType::CMD => {
                     let command = item.command.unwrap();

@@ -82,7 +82,7 @@ pub fn write_prepare_bootstrap(engines: &Engines, region: &metapb::Region) -> Re
 
 // Clear first region meta and prepare state.
 pub fn clear_prepare_bootstrap(engines: &Engines, region_id: u64) -> Result<()> {
-    engines.raft_engine.clean_region(region_id);
+    engines.raft_engine.clean_region(region_id).unwrap();
 
     let wb = WriteBatch::new();
     wb.delete(&keys::prepare_bootstrap_key())?;
@@ -138,7 +138,7 @@ mod tests {
     use raftstore::store::{keys, Engines};
     use storage::CF_DEFAULT;
     use raftengine::{LogBatch, MultiRaftEngine as RaftEngine, RecoveryMode,
-                     DEFAULT_BYTES_PER_SYNC, DEFAULT_LOG_MAX_SIZE};
+                     DEFAULT_BYTES_PER_SYNC, DEFAULT_HIGH_WATER_SIZE, DEFAULT_LOG_ROTATE_SIZE};
 
     #[test]
     fn test_bootstrap() {
@@ -151,7 +151,8 @@ mod tests {
             raft_path.to_str().unwrap(),
             RecoveryMode::TolerateCorruptedTailRecords,
             DEFAULT_BYTES_PER_SYNC,
-            DEFAULT_LOG_MAX_SIZE,
+            DEFAULT_LOG_ROTATE_SIZE,
+            DEFAULT_HIGH_WATER_SIZE,
         ));
         let engines = Engines::new(kv_engine.clone(), raft_engine.clone());
 

@@ -49,7 +49,7 @@ use raftstore::coprocessor::split_observer::SplitObserver;
 use raftengine::{LogBatch, MultiRaftEngine as RaftEngine};
 use super::worker::{ApplyRunner, ApplyTask, ApplyTaskRes, CompactRunner, CompactTask,
                     ConsistencyCheckRunner, ConsistencyCheckTask, RaftlogGcRunner, RaftlogGcTask,
-                    RegionRunner, RegionTask, SplitCheckRunner, SplitCheckTask};
+                    RaftlogGcTaskRes, RegionRunner, RegionTask, SplitCheckRunner, SplitCheckTask};
 use super::worker::apply::{ChangePeer, ExecResult};
 use super::{util, Msg, SignificantMsg, SnapManager, SnapshotDeleter, Tick};
 use super::keys::{self, data_end_key, data_key, enc_end_key, enc_start_key};
@@ -143,6 +143,7 @@ pub struct Store<T, C: 'static> {
     split_check_worker: Worker<SplitCheckTask>,
     region_worker: Worker<RegionTask>,
     raftlog_gc_worker: Worker<RaftlogGcTask>,
+    raftlog_gc_receiver: Option<StdReceiver<RaftlogGcTaskRes>>,
     compact_worker: Worker<CompactTask>,
     pd_worker: FutureWorker<PdTask>,
     consistency_check_worker: Worker<ConsistencyCheckTask>,
@@ -166,6 +167,9 @@ pub struct Store<T, C: 'static> {
     pending_votes: RingQueue<RaftMessage>,
 
     store_stat: StoreStat,
+
+    // Regions need to be compacted
+    regions_need_compact: HashSet<u64>,
 }
 
 pub fn create_event_loop<T, C>(cfg: &Config) -> Result<EventLoop<Store<T, C>>>
@@ -218,6 +222,7 @@ impl<T, C> Store<T, C> {
             split_check_worker: Worker::new("split check worker"),
             region_worker: Worker::new("snapshot worker"),
             raftlog_gc_worker: Worker::new("raft gc worker"),
+            raftlog_gc_receiver: None,
             compact_worker: Worker::new("compact worker"),
             pd_worker: pd_worker,
             consistency_check_worker: Worker::new("consistency check worker"),
@@ -235,6 +240,7 @@ impl<T, C> Store<T, C> {
             start_time: time::get_time(),
             is_busy: false,
             store_stat: StoreStat::default(),
+            regions_need_compact: HashSet::default(),
         };
         s.init()?;
         Ok(s)
@@ -501,7 +507,9 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         );
         box_try!(self.region_worker.start(runner));
 
-        let raftlog_gc_runner = RaftlogGcRunner::new(None);
+        let (tx, rx) = mpsc::channel();
+        let raftlog_gc_runner = RaftlogGcRunner::new(Some(tx));
+        self.raftlog_gc_receiver = Some(rx);
         box_try!(self.raftlog_gc_worker.start(raftlog_gc_runner));
 
         let compact_runner = CompactRunner::new(self.kv_engine.clone());
@@ -646,6 +654,18 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                 Ok(ApplyTaskRes::Destroy(p)) => {
                     let store_id = self.store_id();
                     self.destroy_peer(p.region_id(), util::new_peer(store_id, p.id()));
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(e) => panic!("unexpected error {:?}", e),
+            }
+        }
+    }
+
+    fn poll_raftlog_gc(&mut self) {
+        loop {
+            match self.raftlog_gc_receiver.as_ref().unwrap().try_recv() {
+                Ok(res) => {
+                    self.regions_need_compact = res.regions_need_compact;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(e) => panic!("unexpected error {:?}", e),
@@ -1716,7 +1736,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                 applied_idx - first_idx >= self.cfg.raft_log_gc_count_limit
             {
                 compact_idx = applied_idx;
-            } else if peer.raft_log_size_hint >= self.cfg.raft_log_gc_size_limit.0 {
+            } else if self.regions_need_compact.get(&region_id).is_some() {
                 compact_idx = applied_idx;
             } else if replicated_idx < first_idx ||
                 replicated_idx - first_idx <= self.cfg.raft_log_gc_threshold
@@ -2508,6 +2528,7 @@ impl<T: Transport, C: PdClient> mio::Handler for Store<T, C> {
         }
 
         self.poll_apply();
+        self.poll_raftlog_gc();
 
         self.pending_snapshot_regions.clear();
     }

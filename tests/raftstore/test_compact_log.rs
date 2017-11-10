@@ -86,13 +86,9 @@ fn check_compacted(
     sleep_ms(100);
 
     for (id, engines) in all_engines {
-        let mut vec = vec![];
-        assert!(
-            engines
-                .raft_engine
-                .fetch_entries_to(1, 0, compacted_idx[id], &mut vec)
-                .is_err()
-        );
+        for idx in 0..compacted_idx[id] {
+            assert!(engines.raft_engine.get_entry(1, idx).unwrap().is_none());
+        }
     }
     true
 }

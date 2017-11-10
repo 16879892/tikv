@@ -433,9 +433,13 @@ impl PeerStorage {
         max_size: u64,
         buf: &mut Vec<Entry>,
     ) -> raft::Result<u64> {
-        match self.raft_engine
-            .fetch_entries_to(self.get_region_id(), low, high, buf)
-        {
+        match self.raft_engine.fetch_entries_to(
+            self.get_region_id(),
+            low,
+            high,
+            Some(max_size as usize),
+            buf,
+        ) {
             Ok(total) => {
                 debug!("fetch {} entries from raft-engine", total);
                 Ok(total)
@@ -1168,7 +1172,7 @@ mod test {
     use rocksdb::WriteBatch;
     use raftstore::store::engine::Iterable;
     use raftengine::{LogBatch, MultiRaftEngine as RaftEngine, RecoveryMode,
-                     DEFAULT_BYTES_PER_SYNC, DEFAULT_LOG_MAX_SIZE};
+                     DEFAULT_BYTES_PER_SYNC, DEFAULT_HIGH_WATER_SIZE, DEFAULT_LOG_ROTATE_SIZE};
 
     use super::*;
 
@@ -1179,7 +1183,8 @@ mod test {
             raft_path.to_str().unwrap(),
             RecoveryMode::TolerateCorruptedTailRecords,
             DEFAULT_BYTES_PER_SYNC,
-            DEFAULT_LOG_MAX_SIZE,
+            DEFAULT_LOG_ROTATE_SIZE,
+            DEFAULT_HIGH_WATER_SIZE,
         ));
         let engines = Engines::new(kv_db.clone(), raft_db.clone());
         bootstrap::bootstrap_store(&engines, 1, 1).expect("");
@@ -1237,7 +1242,8 @@ mod test {
     }
 
     fn size_of<T: protobuf::Message>(m: &T) -> u32 {
-        m.compute_size()
+        let content = m.write_to_bytes().unwrap();
+        content.len() as u32
     }
 
     #[test]

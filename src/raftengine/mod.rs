@@ -56,6 +56,6 @@ quick_error! {
 
 pub type Result<T> = ::std::result::Result<T, Error>;
 
-pub use self::engine::{MultiRaftEngine, RecoveryMode};
+pub use self::engine::{MultiRaftEngine, RecoveryMode, DEFAULT_HIGH_WATER_SIZE};
 pub use self::log_batch::LogBatch;
-pub use self::pipe_log::{DEFAULT_BYTES_PER_SYNC, DEFAULT_LOG_MAX_SIZE};
+pub use self::pipe_log::{DEFAULT_BYTES_PER_SYNC, DEFAULT_LOG_ROTATE_SIZE};

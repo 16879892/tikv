@@ -53,7 +53,7 @@ use tikv::raftstore::store::debug::{Debugger, RegionInfo};
 use tikv::storage::{ALL_CFS, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use tikv::pd::{PdClient, RpcClient};
 use tikv::raftengine::{MultiRaftEngine as RaftEngine, RecoveryMode, DEFAULT_BYTES_PER_SYNC,
-                       DEFAULT_LOG_MAX_SIZE};
+                       DEFAULT_HIGH_WATER_SIZE, DEFAULT_LOG_ROTATE_SIZE};
 
 fn perror_and_exit<E: Error>(prefix: &str, e: E) -> ! {
     eprintln!("{}: {}", prefix, e);
@@ -73,7 +73,8 @@ fn new_debug_executor(
                     raft_path,
                     RecoveryMode::TolerateCorruptedTailRecords,
                     DEFAULT_BYTES_PER_SYNC,
-                    DEFAULT_LOG_MAX_SIZE,
+                    DEFAULT_LOG_ROTATE_SIZE,
+                    DEFAULT_HIGH_WATER_SIZE,
                 )
             } else {
                 let raft_path = PathBuf::from(kv_path).join("../raft");
@@ -81,7 +82,8 @@ fn new_debug_executor(
                     raft_path.to_str().unwrap(),
                     RecoveryMode::TolerateCorruptedTailRecords,
                     DEFAULT_BYTES_PER_SYNC,
-                    DEFAULT_LOG_MAX_SIZE,
+                    DEFAULT_LOG_ROTATE_SIZE,
+                    DEFAULT_HIGH_WATER_SIZE,
                 )
             };
             Box::new(Debugger::new(Engines::new(Arc::new(db), Arc::new(raft_db)))) as
