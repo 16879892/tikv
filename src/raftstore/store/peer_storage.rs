@@ -1301,7 +1301,7 @@ mod test {
         let mut store = new_storage_from_ents(sched, &td, &[new_entry(3, 3), new_entry(4, 4)]);
         append_ents(&mut store, &[new_entry(5, 5), new_entry(6, 6)]);
 
-        assert_eq!(6, get_meta_key_count(&store));
+        assert_eq!(3, get_meta_key_count(&store));
 
         let kv_wb = WriteBatch::new();
         let mut raft_wb = LogBatch::default();

@@ -299,6 +299,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
     use std::path::Path;
+    use std::fs;
 
     use tempdir::TempDir;
     use rocksdb::{Writable, DB};
@@ -318,10 +319,12 @@ mod tests {
     type DataSet = Vec<(Vec<u8>, Vec<u8>)>;
 
     fn new_temp_engine(path: &TempDir) -> (Arc<DB>, Arc<RaftEngine>) {
+        let db_path = path.path().join(Path::new("db"));
         let raft_path = path.path().join(Path::new("raft"));
+        println!("raft path: {}", raft_path.to_str().unwrap());
         (
             Arc::new(
-                rocksdb::new_engine(path.path().to_str().unwrap(), ALL_CFS).unwrap(),
+                rocksdb::new_engine(db_path.to_str().unwrap(), ALL_CFS).unwrap(),
             ),
             Arc::new(RaftEngine::new(
                 raft_path.to_str().unwrap(),

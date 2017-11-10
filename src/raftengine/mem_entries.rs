@@ -139,6 +139,20 @@ impl MemEntries {
         compact_count
     }
 
+    pub fn get_entry(&self, index: u64) -> Option<Entry> {
+        if self.entry_queue.is_empty() {
+            return None;
+        }
+
+        let first_index = self.entry_queue.front().unwrap().get_index();
+        let last_index = self.entry_queue.back().unwrap().get_index();
+        if index < first_index || index > last_index {
+            return None;
+        }
+
+        Some(self.entry_queue[(index - first_index) as usize].clone())
+    }
+
     pub fn fetch_entries_to(&self, begin: u64, end: u64, vec: &mut Vec<Entry>) -> Result<u64> {
         if end <= begin {
             return Err(box_err!(

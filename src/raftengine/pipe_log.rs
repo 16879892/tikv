@@ -54,6 +54,12 @@ impl PipeLog {
 
     pub fn open(dir: &str, bytes_per_sync: usize, rotate_size: usize) -> Result<PipeLog> {
         let path = Path::new(dir);
+        if !path.exists() {
+            info!("Create raft log directory: {}", dir);
+            fs::create_dir(dir)
+                .unwrap_or_else(|e| panic!("Create raft log directory failed, err: {:?}", e));
+        }
+
         if !path.is_dir() {
             return Err(box_err!("Not directory."));
         }

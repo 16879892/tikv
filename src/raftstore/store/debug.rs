@@ -468,7 +468,6 @@ mod tests {
             (DBType::KV, CF_WRITE),
             (DBType::KV, CF_LOCK),
             (DBType::KV, CF_RAFT),
-            (DBType::RAFT, CF_DEFAULT),
         ];
         for (db, cf) in valid_cases {
             validate_db_and_cf(db, cf).unwrap();
@@ -535,7 +534,6 @@ mod tests {
         let debugger = new_debugger();
         let raft_engine = &debugger.engines.raft_engine;
         let (region_id, log_index) = (1, 1);
-        let key = keys::raft_log_key(region_id, log_index);
         let mut entry = Entry::new();
         entry.set_term(1);
         entry.set_index(1);
@@ -545,10 +543,7 @@ mod tests {
         log_batch.add_entries(region_id, vec![entry.clone()]);
         raft_engine.write(log_batch, false).unwrap();
         assert_eq!(
-            raft_engine
-                .get_msg::<Entry>(region_id, key.as_slice())
-                .unwrap()
-                .unwrap(),
+            raft_engine.get_entry(region_id, log_index).unwrap().unwrap(),
             entry
         );
 

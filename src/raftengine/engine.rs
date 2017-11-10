@@ -285,10 +285,7 @@ impl MultiRaftEngine {
             .read()
             .unwrap();
         if let Some(mem_entries) = mem_entries.get(&region_id) {
-            let mut vec = vec![];
-            mem_entries
-                .fetch_entries_to(log_idx, log_idx + 1, &mut vec)?;
-            Ok(Some(vec[0].clone()))
+            Ok(mem_entries.get_entry(log_idx))
         } else {
             Ok(None)
         }
@@ -327,7 +324,7 @@ impl MultiRaftEngine {
         true
     }
 
-    pub fn region_is_empty(&self, region_id: u64) -> bool {
+    pub fn region_not_exist(&self, region_id: u64) -> bool {
         let mem_entries = self.mem_entries[region_id as usize % SLOTS_COUNT]
             .read()
             .unwrap();

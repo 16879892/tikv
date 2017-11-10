@@ -82,9 +82,7 @@ pub fn write_prepare_bootstrap(engines: &Engines, region: &metapb::Region) -> Re
 
 // Clear first region meta and prepare state.
 pub fn clear_prepare_bootstrap(engines: &Engines, region_id: u64) -> Result<()> {
-    let mut raft_wb = LogBatch::default();
-    raft_wb.delete(region_id, &keys::raft_state_key(region_id));
-    engines.raft_engine.write(raft_wb, true)?;
+    engines.raft_engine.clean_region(region_id);
 
     let wb = WriteBatch::new();
     wb.delete(&keys::prepare_bootstrap_key())?;
@@ -196,6 +194,6 @@ mod tests {
                 &keys::region_meta_prefix(2)
             ).unwrap()
         );
-        assert!(raft_engine.region_is_empty(1));
+        assert!(raft_engine.region_not_exist(1));
     }
 }
