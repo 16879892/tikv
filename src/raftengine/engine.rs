@@ -3,6 +3,7 @@ use std::u64;
 use std::cmp;
 use std::io::BufRead;
 use std::sync::RwLock;
+use std::mem;
 
 use protobuf;
 use kvproto::eraftpb::Entry;
@@ -14,52 +15,55 @@ use super::Error;
 use super::mem_entries::MemEntries;
 use super::pipe_log::{PipeLog, FILE_MAGIC_HEADER, VERSION};
 use super::log_batch::{Command, LogBatch, LogItemType, OpType};
-
-pub const DEFAULT_HIGH_WATER_SIZE: usize = 1024 * 1024 * 1024; // 1GB
+use super::config::Config;
 
 const SLOTS_COUNT: usize = 32;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
+#[repr(i32)]
 pub enum RecoveryMode {
     TolerateCorruptedTailRecords = 0,
     AbsoluteConsistency = 1,
 }
 
-pub struct MultiRaftEngine {
-    // Raft log directory.
-    pub dir: String,
+impl From<i32> for RecoveryMode {
+    fn from(i: i32) -> RecoveryMode {
+        assert!(
+            RecoveryMode::TolerateCorruptedTailRecords as i32 <= i &&
+                i <= RecoveryMode::AbsoluteConsistency as i32
+        );
+        unsafe { mem::transmute(i) }
+    }
+}
+
+pub struct RaftEngine {
+    cfg: Config,
 
     // Multiple slots
     // region_id -> MemEntries.
-    pub mem_entries: Vec<RwLock<HashMap<u64, MemEntries>>>,
+    mem_entries: Vec<RwLock<HashMap<u64, MemEntries>>>,
 
     // Persistent entries.
-    pub pipe_log: RwLock<PipeLog>,
-
-    // Todo: use unified configuration
-    high_water_size: usize,
+    pipe_log: RwLock<PipeLog>,
 }
 
-impl MultiRaftEngine {
-    pub fn new(
-        dir: &str,
-        recovery_mode: RecoveryMode,
-        bytes_per_sync: usize,
-        log_rotate_size: usize,
-        high_water_size: usize,
-    ) -> MultiRaftEngine {
-        let pip_log = PipeLog::open(dir, bytes_per_sync, log_rotate_size)
-            .unwrap_or_else(|e| panic!("Open raft log failed, error: {:?}", e));
+impl RaftEngine {
+    pub fn new(cfg: Config) -> RaftEngine {
+        let pip_log = PipeLog::open(
+            &cfg.dir,
+            cfg.bytes_per_sync.0 as usize,
+            cfg.log_rotate_size.0 as usize,
+        ).unwrap_or_else(|e| panic!("Open raft log failed, error: {:?}", e));
         let mut mem_entries = Vec::with_capacity(SLOTS_COUNT);
         for _ in 0..SLOTS_COUNT {
             mem_entries.push(RwLock::new(HashMap::default()));
         }
-        let mut engine = MultiRaftEngine {
-            dir: String::from(dir),
+        let mut engine = RaftEngine {
+            cfg: cfg,
             mem_entries: mem_entries,
             pipe_log: RwLock::new(pip_log),
-            high_water_size: high_water_size,
         };
+        let recovery_mode = RecoveryMode::from(engine.cfg.recovery_mode);
         engine
             .recover(recovery_mode)
             .unwrap_or_else(|e| panic!("Recover raft log failed, error: {:?}", e));
@@ -160,7 +164,7 @@ impl MultiRaftEngine {
             let pipe_log = self.pipe_log.read().unwrap();
             (
                 pipe_log.first_file_num(),
-                pipe_log.files_should_evict(self.high_water_size),
+                pipe_log.files_should_evict(self.cfg.total_size_limit.0 as usize),
             )
         };
 
@@ -217,7 +221,7 @@ impl MultiRaftEngine {
             let pipe_log = self.pipe_log.read().unwrap();
             (
                 pipe_log.first_file_num(),
-                pipe_log.files_should_evict(self.high_water_size),
+                pipe_log.files_should_evict(self.cfg.total_size_limit.0 as usize),
             )
         };
 
@@ -370,6 +374,7 @@ impl MultiRaftEngine {
         self.write(log_batch, true)
     }
 
+    // only used in test
     pub fn is_empty(&self) -> bool {
         for mem_entries in &self.mem_entries {
             let mem_entries = mem_entries.read().unwrap();

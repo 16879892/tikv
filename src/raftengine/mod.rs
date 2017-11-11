@@ -6,12 +6,12 @@ use util::codec;
 use protobuf;
 
 
+pub mod config;
 pub mod util;
 pub mod log_batch;
 pub mod pipe_log;
 pub mod mem_entries;
 pub mod engine;
-
 
 
 quick_error! {
@@ -56,6 +56,6 @@ quick_error! {
 
 pub type Result<T> = ::std::result::Result<T, Error>;
 
-pub use self::engine::{MultiRaftEngine, RecoveryMode, DEFAULT_HIGH_WATER_SIZE};
+pub use self::engine::{RaftEngine, RecoveryMode};
 pub use self::log_batch::LogBatch;
-pub use self::pipe_log::{DEFAULT_BYTES_PER_SYNC, DEFAULT_LOG_ROTATE_SIZE};
+pub use self::config::Config;

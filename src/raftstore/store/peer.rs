@@ -42,7 +42,7 @@ use util::Either;
 use util::time::monotonic_raw_now;
 use util::collections::{FlatMap, FlatMapValues as Values, HashSet};
 
-use raftengine::{LogBatch, MultiRaftEngine as RaftEngine};
+use raftengine::{LogBatch, RaftEngine};
 
 use pd::{PdTask, INVALID_ID};
 
@@ -224,8 +224,6 @@ pub struct Peer {
     // Index of last scheduled committed raft log.
     pub last_applying_idx: u64,
     pub last_compacted_idx: u64,
-    // Approximate size of logs that is applied but not compacted yet.
-    pub raft_log_size_hint: u64,
     // When entry exceed max size, reject to propose the entry.
     pub raft_entry_max_size: u64,
 
@@ -360,7 +358,6 @@ impl Peer {
                 index: INVALID_INDEX,
                 hash: vec![],
             },
-            raft_log_size_hint: 0,
             raft_entry_max_size: cfg.raft_entry_max_size.0,
             cfg: cfg,
             leader_lease_expired_time: None,
@@ -789,11 +786,6 @@ impl Peer {
         ready: &mut Ready,
         invoke_ctx: InvokeContext,
     ) -> Option<ApplySnapResult> {
-        if invoke_ctx.has_snapshot() {
-            // When apply snapshot, there is no log applied and not compacted yet.
-            self.raft_log_size_hint = 0;
-        }
-
         let apply_snap_result = self.mut_store().post_ready(invoke_ctx);
 
         if !self.is_leader() {
@@ -834,8 +826,6 @@ impl Peer {
                 self.proposals.clear();
             }
             for entry in committed_entries.iter().rev() {
-                // raft meta is very small, can be ignored.
-                self.raft_log_size_hint += entry.get_data().len() as u64;
                 if to_be_updated {
                     to_be_updated = !self.maybe_update_lease(entry);
                 }

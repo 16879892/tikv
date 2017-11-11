@@ -33,7 +33,7 @@ use raftstore::store::{self, check_abort, keys, ApplyOptions, Peekable, SnapEntr
                        SnapManager};
 use raftstore::store::snap::{Error, Result};
 use storage::CF_RAFT;
-use raftengine::MultiRaftEngine as RaftEngine;
+use raftengine::RaftEngine;
 
 use super::metrics::*;
 use super::super::util;

@@ -457,8 +457,7 @@ mod tests {
     use storage::{CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
     use storage::mvcc::{Lock, LockType};
     use util::rocksdb::{self as rocksdb_util, CFOptions};
-    use raftengine::{LogBatch, MultiRaftEngine as RaftEngine, RecoveryMode,
-                     DEFAULT_BYTES_PER_SYNC, DEFAULT_HIGH_WATER_SIZE, DEFAULT_LOG_ROTATE_SIZE};
+    use raftengine::{Config as RaftEngineCfg, LogBatch, RaftEngine};
     use super::*;
 
     #[test]
@@ -501,13 +500,9 @@ mod tests {
                 ],
             ).unwrap(),
         );
-        let raft_engine = Arc::new(RaftEngine::new(
-            raft_path.to_str().unwrap(),
-            RecoveryMode::TolerateCorruptedTailRecords,
-            DEFAULT_BYTES_PER_SYNC,
-            DEFAULT_LOG_ROTATE_SIZE,
-            DEFAULT_HIGH_WATER_SIZE,
-        ));
+        let mut cfg = RaftEngineCfg::new();
+        cfg.dir = raft_path.to_str().unwrap().to_string();
+        let raft_engine = Arc::new(RaftEngine::new(cfg));
 
         let engines = Engines::new(engine, raft_engine);
         Debugger::new(engines)

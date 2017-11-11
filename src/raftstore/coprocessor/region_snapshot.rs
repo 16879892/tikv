@@ -311,8 +311,7 @@ mod tests {
     use raftstore::store::PeerStorage;
     use storage::{CFStatistics, Cursor, Key, ScanMode, ALL_CFS, CF_DEFAULT};
     use util::{escape, rocksdb, worker};
-    use raftengine::{LogBatch, MultiRaftEngine as RaftEngine, RecoveryMode,
-                     DEFAULT_BYTES_PER_SYNC, DEFAULT_HIGH_WATER_SIZE, DEFAULT_LOG_ROTATE_SIZE};
+    use raftengine::{Config as RaftEngineCfg, LogBatch, RaftEngine};
 
     use super::*;
 
@@ -321,18 +320,14 @@ mod tests {
     fn new_temp_engine(path: &TempDir) -> (Arc<DB>, Arc<RaftEngine>) {
         let db_path = path.path().join(Path::new("db"));
         let raft_path = path.path().join(Path::new("raft"));
+        let mut cfg = RaftEngineCfg::new();
+        cfg.dir = raft_path.to_str().unwrap().to_string();
         println!("raft path: {}", raft_path.to_str().unwrap());
         (
             Arc::new(
                 rocksdb::new_engine(db_path.to_str().unwrap(), ALL_CFS).unwrap(),
             ),
-            Arc::new(RaftEngine::new(
-                raft_path.to_str().unwrap(),
-                RecoveryMode::TolerateCorruptedTailRecords,
-                DEFAULT_BYTES_PER_SYNC,
-                DEFAULT_LOG_ROTATE_SIZE,
-                DEFAULT_HIGH_WATER_SIZE,
-            )),
+            Arc::new(RaftEngine::new(cfg)),
         )
     }
 

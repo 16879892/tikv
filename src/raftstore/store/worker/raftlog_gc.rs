@@ -13,7 +13,7 @@
 
 use util::worker::Runnable;
 use util::collections::HashSet;
-use raftengine::{MultiRaftEngine as RaftEngine, Result as RaftEngineResult};
+use raftengine::{RaftEngine, Result as RaftEngineResult};
 
 use std::sync::Arc;
 use std::fmt::{self, Display, Formatter};
@@ -160,21 +160,15 @@ mod test {
     use kvproto::eraftpb::Entry;
 
     use storage::CF_DEFAULT;
-    use raftengine::{LogBatch, MultiRaftEngine as RaftEngine, RecoveryMode,
-                     DEFAULT_BYTES_PER_SYNC, DEFAULT_HIGH_WATER_SIZE, DEFAULT_LOG_ROTATE_SIZE};
+    use raftengine::{Config as RaftEngineCfg, LogBatch, RaftEngine};
     use super::*;
 
     #[test]
     fn test_gc_raft_log() {
         let path = TempDir::new("gc-raft-log-test").unwrap();
-        let raft_engine = RaftEngine::new(
-            path.path().to_str().unwrap(),
-            RecoveryMode::TolerateCorruptedTailRecords,
-            DEFAULT_BYTES_PER_SYNC,
-            DEFAULT_LOG_ROTATE_SIZE,
-            DEFAULT_HIGH_WATER_SIZE,
-        );
-        let raft_engine = Arc::new(raft_engine);
+        let mut cfg = RaftEngineCfg::new();
+        cfg.dir = path.path().to_str().unwrap().to_string();
+        let raft_engine = Arc::new(RaftEngine::new(cfg));
 
         let mut runner = Runner::new(None);
 

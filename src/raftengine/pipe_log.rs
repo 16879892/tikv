@@ -15,10 +15,6 @@ const FILE_NAME_LEN: usize = FILE_NUM_LEN + LOG_SUFFIX_LEN;
 pub const FILE_MAGIC_HEADER: &'static [u8] = b"RAFT-LOG-FILE-HEADER";
 pub const VERSION: &'static [u8] = b"v1.0.0";
 const INIT_FILE_NUM: u64 = 1;
-const KB: usize = 1024;
-const MB: usize = KB * KB;
-pub const DEFAULT_BYTES_PER_SYNC: usize = 32 * KB;
-pub const DEFAULT_LOG_ROTATE_SIZE: usize = 128 * MB;
 
 pub struct PipeLog {
     first_file_num: u64,

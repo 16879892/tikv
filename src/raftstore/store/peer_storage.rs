@@ -36,7 +36,7 @@ use super::peer::ReadyContext;
 use super::metrics::*;
 use super::{SnapEntry, SnapKey, SnapManager, SnapshotStatistics};
 use storage::CF_RAFT;
-use raftengine::{LogBatch, MultiRaftEngine as RaftEngine};
+use raftengine::{LogBatch, RaftEngine};
 
 // When we create a region peer, we should initialize its log term/index > 0,
 // so that we can force the follower peer to sync the snapshot first.
@@ -1171,21 +1171,19 @@ mod test {
     use kvproto::eraftpb::HardState;
     use rocksdb::WriteBatch;
     use raftstore::store::engine::Iterable;
-    use raftengine::{LogBatch, MultiRaftEngine as RaftEngine, RecoveryMode,
-                     DEFAULT_BYTES_PER_SYNC, DEFAULT_HIGH_WATER_SIZE, DEFAULT_LOG_ROTATE_SIZE};
+    use raftengine::{Config as RaftEngineCfg, LogBatch, RaftEngine};
 
     use super::*;
 
     fn new_storage(sched: Scheduler<RegionTask>, path: &TempDir) -> PeerStorage {
         let kv_db = Arc::new(new_engine(path.path().to_str().unwrap(), ALL_CFS).unwrap());
-        let raft_path = path.path().join(Path::new("raft"));
-        let raft_db = Arc::new(RaftEngine::new(
-            raft_path.to_str().unwrap(),
-            RecoveryMode::TolerateCorruptedTailRecords,
-            DEFAULT_BYTES_PER_SYNC,
-            DEFAULT_LOG_ROTATE_SIZE,
-            DEFAULT_HIGH_WATER_SIZE,
-        ));
+        let mut cfg = RaftEngineCfg::new();
+        cfg.dir = path.path()
+            .join(Path::new("raft"))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let raft_db = Arc::new(RaftEngine::new(cfg));
         let engines = Engines::new(kv_db.clone(), raft_db.clone());
         bootstrap::bootstrap_store(&engines, 1, 1).expect("");
         let region = bootstrap::prepare_bootstrap(&engines, 1, 1, 1).expect("");

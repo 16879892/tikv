@@ -46,7 +46,7 @@ use util::collections::{HashMap, HashSet};
 use storage::{CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
 use raftstore::coprocessor::CoprocessorHost;
 use raftstore::coprocessor::split_observer::SplitObserver;
-use raftengine::{LogBatch, MultiRaftEngine as RaftEngine};
+use raftengine::{LogBatch, RaftEngine};
 use super::worker::{ApplyRunner, ApplyTask, ApplyTaskRes, CompactRunner, CompactTask,
                     ConsistencyCheckRunner, ConsistencyCheckTask, RaftlogGcRunner, RaftlogGcTask,
                     RaftlogGcTaskRes, RegionRunner, RegionTask, SplitCheckRunner, SplitCheckTask};
@@ -1318,10 +1318,6 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         state: RaftTruncatedState,
     ) {
         let peer = self.region_peers.get_mut(&region_id).unwrap();
-        let total_cnt = peer.last_applying_idx - first_index;
-        // the size of current CompactLog command can be ignored.
-        let remain_cnt = peer.last_applying_idx - state.get_index() - 1;
-        peer.raft_log_size_hint = peer.raft_log_size_hint * remain_cnt / total_cnt;
         let task = RaftlogGcTask::region_task(
             peer.get_store().get_raft_engine().clone(),
             peer.get_store().get_region_id(),
@@ -1732,16 +1728,14 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             let applied_idx = peer.get_store().applied_index();
             let first_idx = peer.get_store().first_index();
             let mut compact_idx;
-            if applied_idx > first_idx &&
-                applied_idx - first_idx >= self.cfg.raft_log_gc_count_limit
-            {
-                compact_idx = applied_idx;
-            } else if self.regions_need_compact.get(&region_id).is_some() {
-                compact_idx = applied_idx;
-            } else if replicated_idx < first_idx ||
+
+            if replicated_idx < first_idx ||
                 replicated_idx - first_idx <= self.cfg.raft_log_gc_threshold
             {
                 continue;
+            }
+            if self.regions_need_compact.get(&region_id).is_some() {
+                compact_idx = applied_idx;
             } else {
                 compact_idx = replicated_idx;
             }

@@ -137,8 +137,7 @@ mod tests {
     use raftstore::store::engine::Peekable;
     use raftstore::store::{keys, Engines};
     use storage::CF_DEFAULT;
-    use raftengine::{LogBatch, MultiRaftEngine as RaftEngine, RecoveryMode,
-                     DEFAULT_BYTES_PER_SYNC, DEFAULT_HIGH_WATER_SIZE, DEFAULT_LOG_ROTATE_SIZE};
+    use raftengine::{Config as RaftEngineCfg, LogBatch, RaftEngine};
 
     #[test]
     fn test_bootstrap() {
@@ -147,13 +146,9 @@ mod tests {
         let kv_engine = Arc::new(
             rocksdb::new_engine(path.path().to_str().unwrap(), &[CF_DEFAULT, CF_RAFT]).unwrap(),
         );
-        let raft_engine = Arc::new(RaftEngine::new(
-            raft_path.to_str().unwrap(),
-            RecoveryMode::TolerateCorruptedTailRecords,
-            DEFAULT_BYTES_PER_SYNC,
-            DEFAULT_LOG_ROTATE_SIZE,
-            DEFAULT_HIGH_WATER_SIZE,
-        ));
+        let mut cfg = RaftEngineCfg::new();
+        cfg.dir = raft_path.to_str().unwrap().to_string();
+        let raft_engine = Arc::new(RaftEngine::new(cfg));
         let engines = Engines::new(kv_engine.clone(), raft_engine.clone());
 
         assert!(bootstrap_store(&engines, 1, 1).is_ok());
